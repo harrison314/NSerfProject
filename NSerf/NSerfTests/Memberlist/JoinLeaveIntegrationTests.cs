@@ -162,8 +162,14 @@ public class JoinLeaveIntegrationTests : IAsyncLifetime
         var leaveResult = await m1.LeaveAsync(TimeSpan.FromSeconds(5));
         leaveResult.Should().BeNull("leave should not return an error");
 
-        // Wait for leave to propagate via gossip (broadcasts are consumed quickly by gossip scheduler)
-        await Task.Delay(1000);
+        // Wait for leave to propagate via gossip. Poll instead of a single fixed delay so the
+        // test tolerates slower convergence under heavy parallel load (assertions below unchanged).
+        for (var i = 0; i < 50; i++) // up to ~5s
+        {
+            if (m1.Members().Count == 1 && m2.Members().Count == 1)
+                break;
+            await Task.Delay(100);
+        }
 
         // m1 marks itself as Left, so Members() excludes it, but m1 still sees m2
         var m1Members = m1.Members();

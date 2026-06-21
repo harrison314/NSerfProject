@@ -39,17 +39,6 @@ public class AgentConfig(bool replayOnJoin = false)
     public TimeSpan RetryIntervalWan { get; set; } = TimeSpan.FromSeconds(30);
     public int RetryMaxAttemptsWan { get; set; }
 
-    // Lighthouse join configuration
-    public bool UseLighthouseStartJoin { get; set; }
-    public bool UseLighthouseRetryJoin { get; set; }
-    public string? LighthouseVersionName { get; set; }
-    public long LighthouseVersionNumber { get; set; }
-    public string? LighthouseBaseUrl { get; set; }
-    public string? LighthouseClusterId { get; set; }
-    public string? LighthousePrivateKey { get; set; }
-    public string? LighthouseAesKey { get; set; }
-    public int LighthouseTimeoutSeconds { get; set; } = 30;
-
     // Memberlist Timeouts
     public TimeSpan ReconnectInterval { get; set; } = TimeSpan.FromSeconds(60);
     public TimeSpan ReconnectTimeout { get; set; } = TimeSpan.FromHours(72);
@@ -131,8 +120,6 @@ public class AgentConfig(bool replayOnJoin = false)
         result.LeaveOnTerm = b.LeaveOnTerm && a.LeaveOnTerm;  // Both must be true
         result.SkipLeaveOnInt = b.SkipLeaveOnInt || a.SkipLeaveOnInt;
         result.EnableSyslog = b.EnableSyslog || a.EnableSyslog;
-        result.UseLighthouseStartJoin = b.UseLighthouseStartJoin || a.UseLighthouseStartJoin;
-        result.UseLighthouseRetryJoin = b.UseLighthouseRetryJoin || a.UseLighthouseRetryJoin;
     }
 
     private static void MergeTimeSpans(AgentConfig a, AgentConfig b, AgentConfig result)
@@ -150,8 +137,6 @@ public class AgentConfig(bool replayOnJoin = false)
         result.RetryMaxAttempts = b.RetryMaxAttempts != 0 ? b.RetryMaxAttempts : a.RetryMaxAttempts;
         result.RetryMaxAttemptsWan = b.RetryMaxAttemptsWan != 0 ? b.RetryMaxAttemptsWan : a.RetryMaxAttemptsWan;
         result.UserEventSizeLimit = b.UserEventSizeLimit != 0 ? b.UserEventSizeLimit : a.UserEventSizeLimit;
-        result.LighthouseVersionNumber = b.LighthouseVersionNumber != 0 ? b.LighthouseVersionNumber : a.LighthouseVersionNumber;
-        result.LighthouseTimeoutSeconds = b.LighthouseTimeoutSeconds != 0 ? b.LighthouseTimeoutSeconds : a.LighthouseTimeoutSeconds;
     }
 
     private static void MergeScalars(AgentConfig a, AgentConfig b, AgentConfig result)
@@ -180,12 +165,6 @@ public class AgentConfig(bool replayOnJoin = false)
         result.Mdns.DisableIPv6 = b.Mdns.DisableIPv6 || a.Mdns.DisableIPv6;
 
         result.Protocol = b.Protocol != 0 ? b.Protocol : a.Protocol;
-
-        result.LighthouseVersionName = GetValueOrDefault(a, b, c => c.LighthouseVersionName);
-        result.LighthouseBaseUrl = GetValueOrDefault(a, b, c => c.LighthouseBaseUrl);
-        result.LighthouseClusterId = GetValueOrDefault(a, b, c => c.LighthouseClusterId);
-        result.LighthousePrivateKey = GetValueOrDefault(a, b, c => c.LighthousePrivateKey);
-        result.LighthouseAesKey = GetValueOrDefault(a, b, c => c.LighthouseAesKey);
     }
 
     private static string GetValueOrDefault(AgentConfig a, AgentConfig b, Func<AgentConfig, string?> getValue)

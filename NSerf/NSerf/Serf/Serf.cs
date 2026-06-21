@@ -387,7 +387,10 @@ public partial class Serf : IDisposable, IAsyncDisposable
             {
                 // Increased delay to allow memberlist to fully initialize
                 await Task.Delay(1000);
-                var addrs = previousNodes.Select(n => n.Addr).ToArray();
+                var addrs = previousNodes
+                    .Where(n => !string.Equals(n.Name, config.NodeName, StringComparison.Ordinal))
+                    .Select(n => n.Addr)
+                    .ToArray();
                 var joinedNow = await serf.JoinAsync(addrs, ignoreOld: true);
                 serf.Logger?.LogInformation("[Serf/AutoRejoin] Synchronous attempt joined {Joined}/{Total}", joinedNow, addrs.Length);
             }
@@ -401,7 +404,10 @@ public partial class Serf : IDisposable, IAsyncDisposable
             {
                 try
                 {
-                    var addrs = previousNodes.Select(n => n.Addr).ToArray();
+                    var addrs = previousNodes
+                    .Where(n => !string.Equals(n.Name, config.NodeName, StringComparison.Ordinal))
+                    .Select(n => n.Addr)
+                    .ToArray();
                     serf.Logger?.LogInformation("[Serf/AutoRejoin] Will attempt to join {Count} addresses: [{Addrs}]",
                         addrs.Length, string.Join(", ", addrs));
 

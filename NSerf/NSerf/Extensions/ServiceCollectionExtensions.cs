@@ -5,7 +5,6 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using NSerf.Lighthouse.Client;
 using Microsoft.Extensions.Options;
 
 namespace NSerf.Extensions;
@@ -58,10 +57,9 @@ public static class ServiceCollectionExtensions
         {
             var options = sp.GetRequiredService<IOptions<NSerfOptions>>().Value;
             var logger = sp.GetService<ILogger<Agent.SerfAgent>>();
-            var lighthouseClient = sp.GetService<ILighthouseClient>();
             var agentConfig = options.ToAgentConfig();
 
-            return new Agent.SerfAgent(agentConfig, logger, lighthouseClient);
+            return new Agent.SerfAgent(agentConfig, logger);
         });
 
         // Register Serf instance accessor (available after agent starts)
