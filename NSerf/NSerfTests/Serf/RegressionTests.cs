@@ -404,7 +404,10 @@ public class RegressionTests : IDisposable
     /// Tests all fixes together in a realistic scenario
     /// NOTE: After Leave, snapshot is cleared, so this tests manual rejoin
     /// </summary>
-    [Fact(Timeout = 30000)]
+    // Heavy end-to-end test: creates 3 Serf nodes and exercises join/leave/restart/rejoin with
+    // several gossip-convergence waits. Given a generous timeout so it does not abort under heavy
+    // CPU contention when the whole suite runs 16-way parallel (it completes in ~10s unloaded).
+    [Fact(Timeout = 90000)]
     public async Task FullLifecycle_WithAllFixes_ShouldWork()
     {
         var snapshotPath = GetTempSnapshotPath();
@@ -487,8 +490,16 @@ public class RegressionTests : IDisposable
         // Attempt rejoin (will be rejected due to lower incarnation after Left)
         await s2Restarted.JoinAsync([$"127.0.0.1:{config1.MemberlistConfig.BindPort}"], ignoreOld: false);
         
-        // Wait for probing to detect failure
-        await Task.Delay(1500);
+        // Wait for probing to detect failure. Poll instead of a single fixed delay so the test
+        // tolerates slower gossip convergence under heavy parallel load (it still asserts the
+        // same end state below).
+        for (var i = 0; i < 100; i++) // up to ~10s
+        {
+            var probing = s1.Members().FirstOrDefault(m => m.Name == "node2");
+            if (probing?.Status is MemberStatus.Left or MemberStatus.Failed)
+                break;
+            await Task.Delay(100);
+        }
 
         // Verify that node2 is detected as Failed on s1 (rejoin was rejected, then probing failed)
         var finalMembers = s1.Members();

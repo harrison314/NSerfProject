@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 using System.Net;
+using System.Net.Sockets;
 using System.Threading.Channels;
 using NSerf.Serf;
 using NSerf.Serf.Events;
@@ -15,8 +16,9 @@ namespace NSerfTests.Serf;
 /// </summary>
 public static class TestHelpers
 {
-    private static int _portCounter = 5000;
     private static readonly object _portLock = new();
+    private static int _portCounter = 10000;
+    private static int _ipCounter;
 
     /// <summary>
     /// Creates a test Serf configuration with aggressive timeouts for faster tests.
@@ -26,11 +28,7 @@ public static class TestHelpers
     /// <returns>Configured SerfConfig for testing</returns>
     public static SerfConfig CreateTestConfig(string? nodeName = null)
     {
-        int port;
-        lock (_portLock)
-        {
-            port = ++_portCounter;
-        }
+        var port = GetFreePort();
 
         nodeName ??= $"test-node-{port}";
 
@@ -62,6 +60,50 @@ public static class TestHelpers
             ReconnectTimeout = TimeSpan.FromMicroseconds(1),
             TombstoneTimeout = TimeSpan.FromMicroseconds(1)
         };
+    }
+
+    /// <summary>
+    /// Allocates a unique, bindable loopback port for a test transport. A monotonic counter
+    /// guarantees two parallel callers never receive the same port number, and each candidate is
+    /// verified to be bindable for BOTH TCP and UDP — NetTransport binds both (NetTransport.cs),
+    /// and Windows reserves/excludes different port ranges per protocol (e.g. TCP 5357, UDP
+    /// 50000-50059). This avoids the WSAEACCES "access forbidden" bind failures that a fixed
+    /// counter (or a TCP-only probe) hits once the full parallel suite allocates enough ports.
+    /// </summary>
+    private static int GetFreePort()
+    {
+        lock (_portLock)
+        {
+            for (var attempt = 0; attempt < 10000; attempt++)
+            {
+                if (_portCounter >= 60000)
+                    _portCounter = 10000;
+
+                var port = ++_portCounter;
+                if (CanBindTcpAndUdp(port))
+                    return port;
+            }
+
+            throw new InvalidOperationException("Unable to find a free port for test configuration");
+        }
+    }
+
+    private static bool CanBindTcpAndUdp(int port)
+    {
+        try
+        {
+            using var tcp = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            tcp.Bind(new IPEndPoint(IPAddress.Loopback, port));
+
+            using var udp = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            udp.Bind(new IPEndPoint(IPAddress.Loopback, port));
+
+            return true;
+        }
+        catch (SocketException)
+        {
+            return false;
+        }
     }
 
     /// <summary>
@@ -281,8 +323,8 @@ public static class TestHelpers
         lock (_portLock)
         {
             // Use 127.0.x.x range for testing
-            // Increment the port counter to get unique IPs
-            var uniqueId = ++_portCounter;
+            // Increment a dedicated counter to get unique IPs
+            var uniqueId = ++_ipCounter;
             var octet = (uniqueId % 254) + 1;
             return IPAddress.Parse($"127.0.0.{octet}");
         }

@@ -37,35 +37,19 @@ public class ConfigSecretsCommandTests
 
         Assert.True(root.TryGetProperty("RPCAuthKey", out var rpcAuthProp));
         Assert.True(root.TryGetProperty("encrypt_key", out var encryptProp));
-        Assert.True(root.TryGetProperty("lighthouse_cluster_id", out var clusterIdProp));
-        Assert.True(root.TryGetProperty("lighthouse_private_key", out var privKeyProp));
-        Assert.True(root.TryGetProperty("lighthouse_aes_key", out var aesKeyProp));
 
         // Base64 + length checks
         var rpcAuth = rpcAuthProp.GetString();
         var encryptKey = encryptProp.GetString();
-        var lighthousePrivateKey = privKeyProp.GetString();
-        var lighthouseAesKey = aesKeyProp.GetString();
 
         Assert.False(string.IsNullOrWhiteSpace(rpcAuth));
         Assert.False(string.IsNullOrWhiteSpace(encryptKey));
-        Assert.False(string.IsNullOrWhiteSpace(lighthousePrivateKey));
-        Assert.False(string.IsNullOrWhiteSpace(lighthouseAesKey));
 
         var rpcAuthBytes = Convert.FromBase64String(rpcAuth!);
         var encryptKeyBytes = Convert.FromBase64String(encryptKey!);
-        var privKeyBytes = Convert.FromBase64String(lighthousePrivateKey!);
-        var aesKeyBytes = Convert.FromBase64String(lighthouseAesKey!);
 
         Assert.Equal(32, rpcAuthBytes.Length);
         Assert.Equal(32, encryptKeyBytes.Length);
-        Assert.True(privKeyBytes.Length > 0); // PKCS#8, size may vary
-        Assert.Equal(32, aesKeyBytes.Length);
-
-        // Cluster id is a GUID
-        var clusterId = clusterIdProp.GetString();
-        Assert.False(string.IsNullOrWhiteSpace(clusterId));
-        Assert.True(Guid.TryParse(clusterId, out _));
 
         // Verify that AgentConfig can deserialize this JSON without error
         var config = JsonSerializer.Deserialize<AgentConfig>(json, new JsonSerializerOptions
@@ -76,9 +60,6 @@ public class ConfigSecretsCommandTests
 
         Assert.NotNull(config);
         Assert.Equal(encryptKey, config!.EncryptKey);
-        Assert.Equal(clusterId, config.LighthouseClusterId);
-        Assert.Equal(lighthousePrivateKey, config.LighthousePrivateKey);
-        Assert.Equal(lighthouseAesKey, config.LighthouseAesKey);
     }
 
     [Fact(Timeout = 5000)]

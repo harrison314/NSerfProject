@@ -113,7 +113,9 @@ public partial class Memberlist : IDisposable, IAsyncDisposable
                 {
                     await PushPullNodeAsync(address, join: true, cancellationToken);
                     numSuccess++;
-                    break; // Successfully joined one node, that's enough
+                    // Contact every supplied address (matches Go's memberlist.Join) instead of
+                    // stopping at the first success, so a self/duplicate address in the list
+                    // (e.g. from snapshot auto-rejoin) does not prevent joining real peers.
                 }
                 catch (Exception ex)
                 {

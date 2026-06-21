@@ -8,8 +8,6 @@ using NSerf.Agent.RPC;
 using System.Text.Json;
 using System.Threading.Channels;
 using NSerf.Memberlist.Security;
-using NSerf.Lighthouse.Client;
-using NSerf.Lighthouse.Client.Models;
 
 namespace NSerf.Agent;
 
@@ -30,7 +28,6 @@ public class SerfAgent : IAsyncDisposable
     private bool _started;
     private readonly SemaphoreSlim _shutdownLock = new(1, 1);
     private Keyring? _loadedKeyring;
-    private readonly ILighthouseClient? _lighthouseClient;
 
     /// <summary>
     /// Circular log writer for monitor command.
@@ -56,11 +53,10 @@ public class SerfAgent : IAsyncDisposable
         WriteIndented = true
     };
 
-    public SerfAgent(AgentConfig config, ILogger? logger = null, ILighthouseClient? lighthouseClient = null)
+    public SerfAgent(AgentConfig config, ILogger? logger = null)
     {
         _config = config ?? throw new ArgumentNullException(nameof(config));
         _logger = logger;
-        _lighthouseClient = lighthouseClient;
 
         // Validate mutual exclusions
         if (_config.Tags.Count > 0 && !string.IsNullOrEmpty(_config.TagsFile))
@@ -131,29 +127,8 @@ public class SerfAgent : IAsyncDisposable
         // Start an event loop
         _eventLoopTask = Task.Run(EventLoopAsync, _cts.Token);
 
-        // Perform initial join using static addresses and/or Lighthouse discovery
+        // Perform initial join using static addresses
         var startJoinTargets = new List<string>(_config.StartJoin);
-
-        if (_config.UseLighthouseStartJoin)
-        {
-            try
-            {
-                var lighthousePeers = await DiscoverPeersWithLighthouseAsync(cancellationToken);
-                if (lighthousePeers.Length > 0)
-                {
-                    _logger?.LogInformation("[Agent] Lighthouse discovered {Count} peers for start join", lighthousePeers.Length);
-                    startJoinTargets.AddRange(lighthousePeers);
-                }
-                else
-                {
-                    _logger?.LogWarning("[Agent] Lighthouse returned no peers for start join");
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger?.LogWarning(ex, "[Agent] Lighthouse start join failed");
-            }
-        }
 
         var distinctStartTargets = startJoinTargets.Distinct().ToArray();
         if (distinctStartTargets.Length > 0)
@@ -170,8 +145,8 @@ public class SerfAgent : IAsyncDisposable
             }
         }
 
-        // Start retry join in the background if configured (static and/or Lighthouse)
-        if (_config.RetryJoin.Length > 0 || _config.UseLighthouseRetryJoin)
+        // Start retry join in the background if configured
+        if (_config.RetryJoin.Length > 0)
         {
             _retryJoinTask = Task.Run(() => RetryJoinAsync(_cts.Token), _cts.Token);
         }
@@ -610,23 +585,6 @@ public class SerfAgent : IAsyncDisposable
             {
                 var retryTargets = new List<string>(_config.RetryJoin);
 
-                if (_config.UseLighthouseRetryJoin)
-                {
-                    try
-                    {
-                        var lighthousePeers = await DiscoverPeersWithLighthouseAsync(cancellationToken);
-                        if (lighthousePeers.Length > 0)
-                        {
-                            _logger?.LogInformation("[Agent] Lighthouse discovered {Count} peers for retry join", lighthousePeers.Length);
-                            retryTargets.AddRange(lighthousePeers);
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger?.LogWarning(ex, "[Agent] Lighthouse retry join discovery failed on attempt {Attempt}", attempt);
-                    }
-                }
-
                 var distinctRetryTargets = retryTargets.Distinct().ToArray();
                 if (distinctRetryTargets.Length == 0)
                 {
@@ -648,44 +606,6 @@ public class SerfAgent : IAsyncDisposable
         }
 
         return true;
-    }
-
-    private async Task<string[]> DiscoverPeersWithLighthouseAsync(CancellationToken cancellationToken)
-    {
-        if (_lighthouseClient == null)
-            return [];
-
-        if (string.IsNullOrWhiteSpace(_config.LighthouseVersionName) ||
-            _config.LighthouseVersionNumber <= 0)
-        {
-            _logger?.LogWarning("[Agent] Lighthouse join enabled but version name/number not set");
-            return [];
-        }
-
-        var address = string.IsNullOrWhiteSpace(_config.AdvertiseAddr) ? _config.BindAddr : _config.AdvertiseAddr;
-        var (ip, port) = _config.AddrParts(address);
-
-        var currentNode = new NodeInfo
-        {
-            IpAddress = ip,
-            Port = port,
-            Metadata = new Dictionary<string, string>(_config.Tags)
-        };
-
-        var peers = await _lighthouseClient.DiscoverNodesAsync(
-            currentNode,
-            _config.LighthouseVersionName,
-            _config.LighthouseVersionNumber,
-            cancellationToken);
-
-        if (peers.Count == 0)
-            return [];
-
-        return peers
-            .Where(p => !(string.Equals(p.IpAddress, ip, StringComparison.OrdinalIgnoreCase) && p.Port == port))
-            .Select(p => $"{p.IpAddress}:{p.Port}")
-            .Distinct()
-            .ToArray();
     }
 
     /// <summary>

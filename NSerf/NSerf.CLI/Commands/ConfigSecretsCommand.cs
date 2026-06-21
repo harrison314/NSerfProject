@@ -13,9 +13,6 @@ namespace NSerf.CLI.Commands;
 /// Generates:
 /// - RPCAuthKey (RPC authentication token)
 /// - encrypt_key (gossip encryption key, 32-byte base64)
-/// - lighthouse_cluster_id (GUID)
-/// - lighthouse_private_key (base64 ECDSA PKCS#8)
-/// - lighthouse_aes_key (base64 32 bytes)
 /// </summary>
 public static class ConfigSecretsCommand
 {
@@ -63,22 +60,13 @@ public static class ConfigSecretsCommand
         // IMPORTANT: EncryptKey must be exactly 32 bytes to satisfy AgentConfig.EncryptBytes()
         var encryptKey = GenerateRandomBase64(32);
 
-        var clusterId = Guid.NewGuid().ToString();
-        var lighthousePrivateKey = GenerateEcdsaPrivateKeyBase64();
-        var lighthouseAesKey = GenerateRandomBase64(32);
-
         return new Dictionary<string, string>
         {
             // Matches AgentConfig.RpcAuthKey attribute: [JsonPropertyName("RPCAuthKey")]
             ["RPCAuthKey"] = rpcAuthKey,
 
             // Matches AgentConfig.EncryptKey with SnakeCaseLower policy: encrypt_key
-            ["encrypt_key"] = encryptKey,
-
-            // Matches AgentConfig.Lighthouse* fields with SnakeCaseLower policy
-            ["lighthouse_cluster_id"] = clusterId,
-            ["lighthouse_private_key"] = lighthousePrivateKey,
-            ["lighthouse_aes_key"] = lighthouseAesKey
+            ["encrypt_key"] = encryptKey
         };
     }
 
@@ -88,12 +76,5 @@ public static class ConfigSecretsCommand
         using var rng = RandomNumberGenerator.Create();
         rng.GetBytes(buffer);
         return Convert.ToBase64String(buffer);
-    }
-
-    private static string GenerateEcdsaPrivateKeyBase64()
-    {
-        using var ecdsa = ECDsa.Create(ECCurve.NamedCurves.nistP256);
-        var pkcs8 = ecdsa.ExportPkcs8PrivateKey();
-        return Convert.ToBase64String(pkcs8);
     }
 }

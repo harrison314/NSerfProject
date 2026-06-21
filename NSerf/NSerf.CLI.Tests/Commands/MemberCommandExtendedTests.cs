@@ -25,7 +25,7 @@ public class MemberCommandExtendedTests : IAsyncLifetime
         }
     }
 
-    [Fact(Timeout = 10000)]
+    [Fact]
     public void Members_ReturnsLocalNode()
     {
         var members = _fixture!.Agent!.Serf!.Members();
@@ -47,7 +47,7 @@ public class MemberCommandExtendedTests : IAsyncLifetime
         Assert.Equal(2, members.Length);
     }
 
-    [Fact(Timeout = 15000)]
+    [Fact]
     public void Members_FilterByStatus_Alive()
     {
         var members = _fixture!.Agent!.Serf!.Members();
@@ -57,7 +57,7 @@ public class MemberCommandExtendedTests : IAsyncLifetime
         Assert.Equal(_fixture.Agent.NodeName, aliveMembers[0].Name);
     }
 
-    [Fact(Timeout = 15000)]
+    [Fact]
     public void Members_FilterByName()
     {
         var nodeName = _fixture!.Agent!.NodeName;
@@ -67,7 +67,7 @@ public class MemberCommandExtendedTests : IAsyncLifetime
         Assert.Single(filtered);
     }
 
-    [Fact(Timeout = 15000)]
+    [Fact]
     public void Members_FilterByTags()
     {
         var members = _fixture!.Agent!.Serf!.Members();
@@ -117,7 +117,7 @@ public class MemberCommandExtendedTests : IAsyncLifetime
         Assert.Equal(Serf.MemberStatus.Left, leftMember.Status);
     }
 
-    [Fact(Timeout = 10000)]
+    [Fact]
     public void Members_ChecksProtocol()
     {
         var members = _fixture!.Agent!.Serf!.Members();
@@ -126,7 +126,7 @@ public class MemberCommandExtendedTests : IAsyncLifetime
         Assert.True(members[0].ProtocolMin <= 5);
     }
 
-    [Fact(Timeout = 10000)]
+    [Fact]
     public void Members_ChecksDelegateVersions()
     {
         var members = _fixture!.Agent!.Serf!.Members();
