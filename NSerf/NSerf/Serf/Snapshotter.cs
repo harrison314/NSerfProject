@@ -1,3 +1,7 @@
+// Copyright (c) BoolHak, Inc.
+// SPDX-License-Identifier: MPL-2.0
+// Ported from: github.com/hashicorp/serf/serf/snapshot.go
+
 using System.Text;
 using System.Threading.Channels;
 using Microsoft.Extensions.Logging;
@@ -43,14 +47,42 @@ public class Snapshotter : IDisposable, IAsyncDisposable
     private readonly ChannelWriter<IEvent>? _outCh;
     private readonly bool _rejoinAfterLeave;
     private readonly CancellationToken _shutdownToken;
-    private readonly TaskCompletionSource _waitTcs = new();
+    // Internal stop signal: linked to the external shutdown token, and also cancelled by
+    // DisposeAsync/Dispose so disposal never depends on the external token being cancelled.
+    private readonly CancellationTokenSource _stopCts;
+    private readonly CancellationToken _stopToken;
+    private volatile bool _disposed;
+    private const int DisposeWaitTimeoutMs = 5000;
+    // RunContinuationsAsynchronously: code that does "await WaitAsync(); Dispose();" must not run
+    // inline on the stream task's own thread, otherwise Dispose() would wait on itself.
+    private readonly TaskCompletionSource _waitTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private DateTime _lastAttemptedCompaction = DateTime.MinValue;
     private readonly object _lock = new();
     private Task? _teeTask;
     private Task? _streamTask;
     private readonly object _fileLock = new();
+    // Serialises event processing and clock updates (Go runs both in the stream goroutine), so the
+    // append/compaction path is never entered by the clock loop and the stream loop at the same time.
+    private readonly object _processLock = new();
     private readonly IMetrics? _metrics;
     private readonly MetricLabel[]? _metricLabels;
+    private int _syncToDiskCount;
+
+    /// <summary>
+    /// Number of times the snapshot has been fsynced (Flush(flushToDisk: true)).
+    /// Instrumentation only; used by tests to assert durability cost.
+    /// </summary>
+    internal int SyncToDiskCount => Volatile.Read(ref _syncToDiskCount);
+
+    /// <summary>
+    /// The single place that forces data to the physical disk (fsync).
+    /// </summary>
+    private void SyncToDisk(FileStream? fs)
+    {
+        if (fs is null) return;
+        Interlocked.Increment(ref _syncToDiskCount);
+        fs.Flush(flushToDisk: true);
+    }
 
     /// <summary>
     /// Creates a new Snapshotter that records events up to a
@@ -176,6 +208,8 @@ public class Snapshotter : IDisposable, IAsyncDisposable
         _outCh = outCh;
         _rejoinAfterLeave = rejoinAfterLeave;
         _shutdownToken = shutdownToken;
+        _stopCts = CancellationTokenSource.CreateLinkedTokenSource(shutdownToken);
+        _stopToken = _stopCts.Token;
         _metrics = metrics;
         _metricLabels = metricLabels;
     }
@@ -225,30 +259,22 @@ public class Snapshotter : IDisposable, IAsyncDisposable
     /// Leave is used to remove known nodes to prevent a restart from
     /// causing a join. Otherwise, nodes will re-join after leaving!
     /// </summary>
-    public async Task LeaveAsync()
+    public Task LeaveAsync()
     {
-        // Flush any pending buffered writes before marking as leaving
-        try
+        // Process leave immediately and synchronously to ensure it's written before shutdown.
+        // HandleLeave appends the marker and flushes/fsyncs under the file lock; the StreamWriter
+        // is not thread-safe, so no unsynchronised pre-flush is performed here.
+        lock (_processLock)
         {
-            if (_bufferedWriter is not null)
-            {
-                await _bufferedWriter.FlushAsync();
-            }
-
-            await _fileHandle!.FlushAsync();
-        }
-        catch
-        {
-            // Ignore flush errors
+            HandleLeave();
         }
 
-        // Process leave immediately and synchronously to ensure it's written before shutdown
-        await HandleLeaveAsync();
+        return Task.CompletedTask;
     }
 
     private void StartProcessing()
     {
-        _logger?.LogInformation("[Snapshotter/StartProcessing] Starting TeeStream and Stream tasks...");
+        _logger?.LogDebug("[Snapshotter/StartProcessing] Starting TeeStream and Stream tasks...");
 
         _teeTask = Task.Factory.StartNew(
             async () => await TeeStreamAsync(),
@@ -262,7 +288,7 @@ public class Snapshotter : IDisposable, IAsyncDisposable
             TaskCreationOptions.LongRunning,
             TaskScheduler.Default).Unwrap();
 
-        _logger?.LogInformation("[Snapshotter/StartProcessing] Tasks started successfully");
+        _logger?.LogDebug("[Snapshotter/StartProcessing] Tasks started successfully");
     }
 
     /// <summary>
@@ -271,22 +297,27 @@ public class Snapshotter : IDisposable, IAsyncDisposable
     /// </summary>
     private async Task TeeStreamAsync()
     {
-        _logger?.LogInformation("[Snapshotter/TeeStream] Task started, waiting for events...");
+        _logger?.LogDebug("[Snapshotter/TeeStream] Task started, waiting for events...");
         try
         {
             // Use ReadAllAsync to automatically respect cancellation
-            await foreach (var evt in _inCh.ReadAllAsync(_shutdownToken))
+            await foreach (var evt in _inCh.ReadAllAsync(_stopToken))
             {
-                _logger?.LogInformation("[Snapshotter/TeeStream] Received event: {Type}", evt.GetType().Name);
+                _logger?.LogDebug("[Snapshotter/TeeStream] Received event: {Type}", evt.GetType().Name);
 
                 // Forward to a stream channel (may block on backpressure)
                 try
                 {
-                    await _streamCh.Writer.WriteAsync(evt, _shutdownToken);
+                    await _streamCh.Writer.WriteAsync(evt, _stopToken);
                 }
                 catch (OperationCanceledException)
                 {
                     // Shutdown requested - stop forwarding
+                    break;
+                }
+                catch (ChannelClosedException)
+                {
+                    // Stream channel completed by disposal - stop forwarding
                     break;
                 }
 
@@ -294,17 +325,21 @@ public class Snapshotter : IDisposable, IAsyncDisposable
                 if (_outCh == null) continue;
                 try
                 {
-                    await _outCh.WriteAsync(evt, _shutdownToken);
+                    await _outCh.WriteAsync(evt, _stopToken);
                 }
                 catch (OperationCanceledException)
                 {
                     // Continue - outCh failure shouldn't stop snapshot writes
                 }
+                catch (ChannelClosedException)
+                {
+                    // Continue - outCh failure shouldn't stop snapshot writes
+                }
             }
         }
-        catch (OperationCanceledException ex)
+        catch (OperationCanceledException)
         {
-            _logger?.LogInformation(ex, "[Snapshotter/TeeStream] Task cancelled (shutdown)");
+            _logger?.LogDebug("[Snapshotter/TeeStream] Task cancelled (shutdown)");
         }
         finally
         {
@@ -313,7 +348,7 @@ public class Snapshotter : IDisposable, IAsyncDisposable
             try
             {
                 _streamCh.Writer.Complete();
-                _logger?.LogInformation("[Snapshotter/TeeStream] Completed streamCh writer");
+                _logger?.LogDebug("[Snapshotter/TeeStream] Completed streamCh writer");
             }
             catch
             {
@@ -327,37 +362,41 @@ public class Snapshotter : IDisposable, IAsyncDisposable
     /// </summary>
     private async Task StreamAsync()
     {
-        _logger?.LogInformation("[Snapshotter/Stream] Task started, processing events...");
+        _logger?.LogDebug("[Snapshotter/Stream] Task started, processing events...");
 
+        // The clock-update loop must stop when the stream loop ends, regardless of
+        // whether the external shutdown token was ever cancelled (e.g. DisposeAsync).
+        using var clockCts = CancellationTokenSource.CreateLinkedTokenSource(_stopToken);
+        var clockToken = clockCts.Token;
         var clockTask = Task.Run(async () =>
         {
             using var clockTimer = new PeriodicTimer(TimeSpan.FromMilliseconds(ClockUpdateIntervalMs));
-            while (!_shutdownToken.IsCancellationRequested)
+            while (!clockToken.IsCancellationRequested)
             {
                 try
                 {
-                    await clockTimer.WaitForNextTickAsync(_shutdownToken);
-                    UpdateClock();
+                    await clockTimer.WaitForNextTickAsync(clockToken);
+                    lock (_processLock)
+                    {
+                        UpdateClock();
+                    }
                 }
                 catch (OperationCanceledException)
                 {
                     break;
                 }
+                catch (Exception ex)
+                {
+                    _logger?.LogDebug(ex, "[Snapshotter] Clock update error");
+                }
             }
-        });
+        }, CancellationToken.None);
 
         try
         {
-            await foreach (var evt in _streamCh.Reader.ReadAllAsync(_shutdownToken))
+            await foreach (var evt in _streamCh.Reader.ReadAllAsync(_stopToken))
             {
-                // Check for leave
-                if (_leaveCh.Reader.TryRead(out var _))
-                {
-                    await HandleLeaveAsync();
-                }
-
-                // Process the event
-                await FlushEventAsync(evt);
+                ProcessStreamItem(evt);
             }
         }
         catch (OperationCanceledException)
@@ -370,7 +409,7 @@ public class Snapshotter : IDisposable, IAsyncDisposable
         }
         finally
         {
-            _shutdownToken.WaitHandle.WaitOne(100);
+            clockCts.Cancel();
             await clockTask;
         }
 
@@ -383,42 +422,91 @@ public class Snapshotter : IDisposable, IAsyncDisposable
             _logger?.LogError(ex, "Shutdown flush error");
         }
 
-        _fileHandle?.Close();
-        _waitTcs.SetResult();
+        try
+        {
+            lock (_fileLock)
+            {
+                _fileHandle?.Close();
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogDebug(ex, "[Snapshotter] Error closing snapshot file");
+        }
+
+        _waitTcs.TrySetResult();
+    }
+
+    /// <summary>
+    /// Handles one item of the stream loop: a pending leave first, then the event itself.
+    /// </summary>
+    private void ProcessStreamItem(IEvent evt)
+    {
+        lock (_processLock)
+        {
+            // Check for leave
+            if (_leaveCh.Reader.TryRead(out _))
+            {
+                HandleLeave();
+            }
+
+            // Process the event
+            FlushEvent(evt);
+        }
     }
 
     private async Task PerformShutdownFlushAsync()
     {
-        // Snapshot the clock first
-        UpdateClock();
-
-        // Process any pending leave events FIRST
-        while (_leaveCh.Reader.TryRead(out _))
+        lock (_processLock)
         {
-            await HandleLeaveAsync();
+            // Snapshot the clock first
+            UpdateClock();
+
+            // Process any pending leave events FIRST
+            while (_leaveCh.Reader.TryRead(out _))
+            {
+                HandleLeave();
+            }
         }
 
-        // Wait for TeeStreamAsync to complete the channel, then drain remaining events
-        // Use ReadAllAsync with timeout to ensure we don't wait forever
+        // Drain the events that are already queued, bounded by the flush timeout (Go's FLUSH loop
+        // selects on flushTimeout for every event). ReadAllAsync only observes cancellation while it
+        // waits for an item, so the deadline is also checked once per event.
         using var cts = new CancellationTokenSource(ShutdownFlushTimeoutMs);
+        var drainTimedOut = false;
         try
         {
             await foreach (var evt in _streamCh.Reader.ReadAllAsync(cts.Token))
             {
-                await FlushEventAsync(evt);
+                if (cts.IsCancellationRequested)
+                {
+                    drainTimedOut = true;
+                    break;
+                }
+
+                ProcessStreamItem(evt);
             }
         }
-        catch (OperationCanceledException e)
+        catch (OperationCanceledException)
         {
-            // Timeout reached - acceptable data loss scenario
-            _logger?.LogWarning(e, "[Snapshotter] Shutdown drain timeout - some pending events may not be persisted");
+            drainTimedOut = true;
         }
 
-        // Final flush
+        if (drainTimedOut)
+        {
+            // Timeout reached - acceptable data loss scenario
+            _logger?.LogWarning("[Snapshotter] Shutdown drain timeout - some pending events may not be persisted");
+        }
+
+        // Final flush: flush the buffer and fsync once (Go: s.buffered.Flush(); s.fh.Sync())
         try
         {
-            await _bufferedWriter!.FlushAsync();
-            await _fileHandle!.FlushAsync();
+            lock (_fileLock)
+            {
+                if (_disposed) return;
+                _bufferedWriter?.Flush();
+                SyncToDisk(_fileHandle);
+            }
         }
         catch (Exception ex)
         {
@@ -426,7 +514,7 @@ public class Snapshotter : IDisposable, IAsyncDisposable
         }
     }
 
-    private Task HandleLeaveAsync()
+    private void HandleLeave()
     {
         _leaving = true;
 
@@ -446,26 +534,27 @@ public class Snapshotter : IDisposable, IAsyncDisposable
         // Ensure the leave marker is flushed to disk before returning (critical for durability)
         try
         {
-            // Flush writer buffer
             lock (_fileLock)
             {
-                _bufferedWriter?.Flush();
+                if (!_disposed)
+                {
+                    // Flush writer buffer
+                    _bufferedWriter?.Flush();
+
+                    // Force fsync to ensure data reaches the disk (critical for leave marker)
+                    SyncToDisk(_fileHandle);
+                }
             }
 
-            // Force fsync to ensure data reaches the disk (critical for leave marker)
-            _fileHandle?.Flush(true);
-
-            _logger?.LogInformation("[Snapshotter] Leave marker successfully written and flushed");
+            _logger?.LogDebug("[Snapshotter] Leave marker successfully written and flushed");
         }
         catch (Exception ex)
         {
             _logger?.LogError(ex, "Failed to flush leave to snapshot");
         }
-
-        return Task.CompletedTask;
     }
 
-    private async Task FlushEventAsync(IEvent e)
+    private void FlushEvent(IEvent e)
     {
         // Stop recording events after a leave is issued
         if (_leaving)
@@ -476,7 +565,7 @@ public class Snapshotter : IDisposable, IAsyncDisposable
         switch (e)
         {
             case MemberEvent memberEvent:
-                await ProcessMemberEventAsync(memberEvent);
+                ProcessMemberEvent(memberEvent);
                 break;
             case UserEvent userEvent:
                 ProcessUserEvent(userEvent);
@@ -490,9 +579,9 @@ public class Snapshotter : IDisposable, IAsyncDisposable
         }
     }
 
-    private async Task ProcessMemberEventAsync(MemberEvent e)
+    private void ProcessMemberEvent(MemberEvent e)
     {
-        _logger?.LogInformation("[Snapshotter] Processing MemberEvent: {Type} with {Count} members",
+        _logger?.LogDebug("[Snapshotter] Processing MemberEvent: {Type} with {Count} members",
             e.EventType(), e.Members.Count);
 
         lock (_lock)
@@ -504,7 +593,7 @@ public class Snapshotter : IDisposable, IAsyncDisposable
                     {
                         var addr = $"{mem.Addr}:{mem.Port}";
                         _aliveNodes[mem.Name] = addr;
-                        _logger?.LogInformation("[Snapshotter] Recording alive node: {Name} at {Addr}", mem.Name, addr);
+                        _logger?.LogDebug("[Snapshotter] Recording alive node: {Name} at {Addr}", mem.Name, addr);
                         TryAppend($"alive: {mem.Name} {addr}\n");
                     }
                     break;
@@ -514,40 +603,39 @@ public class Snapshotter : IDisposable, IAsyncDisposable
                     foreach (var name in e.Members.Select(mem => mem.Name))
                     {
                         _aliveNodes.Remove(name);
-                        _logger?.LogInformation("[Snapshotter] Recording not-alive node: {Name}", name);
+                        _logger?.LogDebug("[Snapshotter] Recording not-alive node: {Name}", name);
                         TryAppend($"not-alive: {name}\n");
                     }
                     break;
             }
 
-            _logger?.LogInformation("[Snapshotter] Total alive nodes in memory: {Count}", _aliveNodes.Count);
+            _logger?.LogDebug("[Snapshotter] Total alive nodes in memory: {Count}", _aliveNodes.Count);
         }
         UpdateClock();
-        // Force an immediate flush to make the snapshot visible promptly
-        await ForceFlushAsync();
+        // Flush the writer buffer to the OS so the snapshot is visible promptly.
+        // No fsync here: Go only flushes its bufio writer periodically and syncs on compaction;
+        // an fsync per member event costs milliseconds and makes shutdown drains take seconds.
+        FlushBufferToOs();
     }
 
-    private Task ForceFlushAsync()
+    /// <summary>
+    /// Flushes the StreamWriter buffer through to the OS page cache (no fsync).
+    /// </summary>
+    private void FlushBufferToOs()
     {
         try
         {
-            // Flush writer inside lock for atomicity
             lock (_fileLock)
             {
+                if (_disposed) return;
                 _bufferedWriter?.Flush();
+                _lastFlush = DateTime.UtcNow;
             }
-
-            // Force data to disk (outside lock)
-            _fileHandle?.Flush(flushToDisk: true);
-
-            _lastFlush = DateTime.UtcNow;
         }
         catch (Exception ex)
         {
-            _logger?.LogError(ex, "Force flush error");
+            _logger?.LogError(ex, "Snapshot flush error");
         }
-
-        return Task.CompletedTask;
     }
 
     private void UpdateClock()
@@ -574,16 +662,8 @@ public class Snapshotter : IDisposable, IAsyncDisposable
 
         LastEventClock = e.LTime;
         TryAppend($"event-clock: {(ulong)e.LTime}\n");
-        // Force immediate flush for reliability
-        try
-        {
-            _bufferedWriter?.Flush();
-            _fileHandle?.Flush();
-        }
-        catch
-        {
-            // Ignore flush errors
-        }
+        // Make the clock visible promptly (OS flush, no fsync)
+        FlushBufferToOs();
     }
 
     private void ProcessQuery(Query q)
@@ -596,16 +676,8 @@ public class Snapshotter : IDisposable, IAsyncDisposable
 
         LastQueryClock = q.LTime;
         TryAppend($"query-clock: {(ulong)q.LTime}\n");
-        // Force immediate flush for reliability
-        try
-        {
-            _bufferedWriter?.Flush();
-            _fileHandle?.Flush();
-        }
-        catch
-        {
-            // Ignore flush errors
-        }
+        // Make the clock visible promptly (OS flush, no fsync)
+        FlushBufferToOs();
     }
 
     private void TryAppend(string line)
@@ -647,7 +719,10 @@ public class Snapshotter : IDisposable, IAsyncDisposable
 
             lock (_fileLock)
             {
-                _bufferedWriter!.Write(line);
+                // Tolerate a closed handle: after disposal there is nothing to append to
+                if (_disposed || _bufferedWriter is null) return;
+
+                _bufferedWriter.Write(line);
 
                 // Check if we should flush
                 var now = DateTime.UtcNow;
@@ -655,14 +730,13 @@ public class Snapshotter : IDisposable, IAsyncDisposable
                 {
                     _lastFlush = now;
                     _bufferedWriter.Flush();
-                    _fileHandle!.Flush();
                 }
 
                 _offset += bytes;
             }
 
             // Check compaction outside the file lock to avoid long-held locks during I/O
-            if (_offset > SnapshotMaxSize())
+            if (!_disposed && _offset > SnapshotMaxSize())
             {
                 Compact();
             }
@@ -692,6 +766,8 @@ public class Snapshotter : IDisposable, IAsyncDisposable
         // Reference: defer metrics.MeasureSinceWithLabels([]string{"serf", "snapshot", "compact"}, time.Now(), s.metricLabels)
         using (_metrics?.MeasureSince(["serf", "snapshot", "compact"], _metricLabels))
         {
+            if (_disposed) return;
+
             var newPath = _path + TmpExt;
 
             // Step 1: Snapshot the alive nodes (SHORT lock)
@@ -730,12 +806,22 @@ public class Snapshotter : IDisposable, IAsyncDisposable
                 newOffset += Encoding.UTF8.GetByteCount(queryClockLine);
 
                 writer.Flush();
-                newFile.Flush(true);
+                SyncToDisk(newFile);
             } // Close and flush a new file before swap
 
             // Atomic file swap (SHORT lock - just the swap operation)
             lock (_fileLock)
             {
+                if (_disposed)
+                {
+                    try { File.Delete(newPath); }
+                    catch
+                    {
+                        // ignored
+                    }
+                    return;
+                }
+
                 try
                 {
                     _bufferedWriter?.Flush();
@@ -768,7 +854,7 @@ public class Snapshotter : IDisposable, IAsyncDisposable
                 }
 
                 _bufferedWriter.Flush();
-                _fileHandle.Flush(true);  // Force fsync for durability
+                SyncToDisk(_fileHandle);  // Force fsync for durability
             }
         }
     }
@@ -889,21 +975,13 @@ public class Snapshotter : IDisposable, IAsyncDisposable
     /// </summary>
     public async ValueTask DisposeAsync()
     {
-        // Signal no more events will be written to streamCh
-        try
-        {
-            _streamCh.Writer.Complete();
-        }
-        catch
-        {
-            // Channel may already be completed
-        }
+        // Stop the background tasks. This does not require the external shutdown
+        // token to be cancelled: the internal stop token ends the tee/stream loops
+        // (and therefore the clock loop), and the stream loop performs its final flush.
+        SignalStop();
 
         // Wait for background tasks to finish
-        var tasks = new List<Task>();
-        if (_teeTask != null) tasks.Add(_teeTask);
-        if (_streamTask != null) tasks.Add(_streamTask);
-
+        var tasks = BackgroundTasks();
         if (tasks.Count > 0)
         {
             try
@@ -934,24 +1012,104 @@ public class Snapshotter : IDisposable, IAsyncDisposable
     /// </summary>
     public void Dispose()
     {
-        try
+        if (_disposed)
         {
-            _bufferedWriter?.Dispose();
+            return;
         }
-        catch (ObjectDisposedException)
+
+        // Stop the background tasks first (bounded wait) so the writer/file handle are
+        // not disposed underneath the Tee/Stream tasks.
+        SignalStop();
+        var tasks = BackgroundTasks();
+        if (tasks.Count > 0)
         {
-            // Already disposed by StreamAsync
+            try
+            {
+                // The continuation observes any fault (reads Exception) so a timed-out wait never throws
+                var completed = Task.WhenAll(tasks)
+                    .ContinueWith(t => { _ = t.Exception; }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default)
+                    .Wait(DisposeWaitTimeoutMs);
+                if (!completed)
+                {
+                    _logger?.LogWarning("[Snapshotter] Background tasks did not stop within {Timeout}ms; disposing anyway", DisposeWaitTimeoutMs);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogDebug(ex, "[Snapshotter] Error waiting for background tasks during Dispose");
+            }
+        }
+
+        lock (_fileLock)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+            _disposed = true;
+
+            try
+            {
+                _bufferedWriter?.Dispose();
+            }
+            catch (Exception)
+            {
+                // Already disposed by StreamAsync / underlying stream closed
+            }
+
+            try
+            {
+                _fileHandle?.Dispose();
+            }
+            catch (Exception)
+            {
+                // Already disposed by StreamAsync
+            }
         }
 
         try
         {
-            _fileHandle?.Dispose();
+            _stopCts.Dispose();
+        }
+        catch (Exception)
+        {
+            // ignored
+        }
+
+        GC.SuppressFinalize(this);
+    }
+
+    /// <summary>
+    /// Requests the background tasks to stop without cancelling the external shutdown token.
+    /// </summary>
+    private void SignalStop()
+    {
+        try
+        {
+            if (!_stopCts.IsCancellationRequested)
+            {
+                _stopCts.Cancel();
+            }
         }
         catch (ObjectDisposedException)
         {
-            // Already disposed by StreamAsync
+            // Already disposed
         }
-        GC.SuppressFinalize(this);
+        catch (AggregateException ex)
+        {
+            _logger?.LogDebug(ex, "[Snapshotter] Error signalling stop");
+        }
+
+        // Signal no more events will be written to streamCh (TeeStream does this too)
+        _streamCh.Writer.TryComplete();
+    }
+
+    private List<Task> BackgroundTasks()
+    {
+        var tasks = new List<Task>(2);
+        if (_teeTask != null) tasks.Add(_teeTask);
+        if (_streamTask != null) tasks.Add(_streamTask);
+        return tasks;
     }
 }
 

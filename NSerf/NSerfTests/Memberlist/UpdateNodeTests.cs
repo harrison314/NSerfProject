@@ -10,6 +10,7 @@ using NSerf.Memberlist.Delegates;
 using NSerf.Memberlist.Messages;
 using NSerf.Memberlist.State;
 using NSerf.Memberlist.Transport;
+using NSerfTests.Serf;
 
 
 namespace NSerfTests.Memberlist;
@@ -52,7 +53,8 @@ public class UpdateNodeTests : IDisposable
         config.Name = nodeName;
         config.BindAddr = "127.0.0.1";
         config.BindPort = 0; // Auto-assign
-        config.AdvertiseAddr = "127.0.0.1";
+        // No explicit AdvertiseAddr: with one set, memberlist advertises Config.AdvertisePort (7946 by
+        // default) rather than the OS-assigned port, and every gossip/probe would go to the wrong port.
         config.Logger = NullLogger.Instance;
         config.Delegate = customDelegate;
         
@@ -111,7 +113,7 @@ public class UpdateNodeTests : IDisposable
         numJoined.Should().BeGreaterThan(0, "join should succeed");
 
         // Wait for cluster to converge
-        await Task.Delay(500);
+        await WaitForTwoMembersAsync(ml1, ml2);
 
         return (ml1, ml2);
     }
@@ -143,30 +145,35 @@ public class UpdateNodeTests : IDisposable
         
         error.Should().BeNull();
         numJoined.Should().BeGreaterThan(0);
-        await Task.Delay(500);
+        await WaitForTwoMembersAsync(ml1, ml2);
 
         // Verify initial metadata
         ml1.LocalNode.Meta.Should().BeEquivalentTo(metadata1);
+        await TestHelpers.WaitForConditionAsync(
+            () => MetaSeenBy(ml2, "node1") is { } meta && meta.SequenceEqual(metadata1),
+            TimeSpan.FromSeconds(5), "ml2 never learned node1's initial metadata");
 
         // Act: Change metadata and call UpdateNode
         currentMeta = metadata2;
         await ml1.UpdateNodeAsync(TimeSpan.FromSeconds(1));
 
-        // Give time for broadcast to propagate
-        await Task.Delay(500);
-
         // Assert: ml1 should have new metadata
         ml1.LocalNode.Meta.Should().BeEquivalentTo(metadata2, "local node should reflect new metadata");
 
-        // Assert: ml2 should see ml1's new metadata
-        // Note: This requires full memberlist gossip/broadcast which is complex
-        // For now, verify that ml1 has the updated metadata (core UpdateNode functionality works)
-        // Full cluster propagation testing would require more sophisticated memberlist setup
-        
         // Verify ml1 can see itself with new metadata
         var ml1ViewFromMl1 = ml1.Members().FirstOrDefault(m => m.Name == "node1");
         ml1ViewFromMl1.Should().NotBeNull("node1 should see itself");
         ml1ViewFromMl1!.Meta.Should().BeEquivalentTo(metadata2, "node1 should see its own updated metadata");
+
+        // Assert: the REMOTE node must observe the broadcast alive message carrying the new metadata
+        // (Go: TestMemberlist_UpdateNode checks the delegate meta; the broadcast is what makes it visible cluster-wide)
+        await TestHelpers.WaitForConditionAsync(
+            () => MetaSeenBy(ml2, "node1") is { } meta && meta.SequenceEqual(metadata2),
+            TimeSpan.FromSeconds(5),
+            () => $"node1's metadata update was not broadcast to node2 (node2 sees [{string.Join(",", MetaSeenBy(ml2, "node1") ?? [])}])");
+
+        var ml1ViewFromMl2 = ml2.Members().First(m => m.Name == "node1");
+        ml1ViewFromMl2.Meta.Should().BeEquivalentTo(metadata2, "node2 should see node1's updated metadata");
     }
 
     #endregion
@@ -203,20 +210,36 @@ public class UpdateNodeTests : IDisposable
     [Fact]
     public async Task UpdateNode_WithSameMetadata_ShouldStillBroadcast()
     {
-        // Arrange
+        // Arrange: 2-node cluster; node1's metadata never changes
         var metadata = new byte[] { 0x42 };
         var delegate1 = new TestDelegate(() => metadata);
-        var ml = CreateTestMemberlist("node1", delegate1);
-        await Task.Delay(100);
+        var ml1 = CreateTestMemberlist("node1", delegate1);
+        var ml2 = CreateTestMemberlist("node2");
+        await Task.Delay(200);
 
-        var incarnation1 = ml.Incarnation;
+        using var joinCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var (numJoined, error) = await ml1.JoinAsync(new[] { $"127.0.0.1:{ml2.Config.BindPort}" }, joinCts.Token);
+        error.Should().BeNull();
+        numJoined.Should().BeGreaterThan(0);
+        await WaitForTwoMembersAsync(ml1, ml2);
 
-        // Act: Call UpdateNode twice with same metadata
-        await ml.UpdateNodeAsync(TimeSpan.FromSeconds(1));
-        var incarnation2 = ml.Incarnation;
+        var incarnation1 = ml1.Incarnation;
 
-        await ml.UpdateNodeAsync(TimeSpan.FromSeconds(1));
-        var incarnation3 = ml.Incarnation;
+        // Act: Call UpdateNode twice with the same metadata; each call must reach node2 (Go: UpdateNode
+        // always bumps the incarnation and broadcasts, even when the metadata did not change)
+        await ml1.UpdateNodeAsync(TimeSpan.FromSeconds(1));
+        var incarnation2 = ml1.Incarnation;
+        await TestHelpers.WaitForConditionAsync(
+            () => ml2.NodeMap.TryGetValue("node1", out var st) && st.Incarnation == incarnation2,
+            TimeSpan.FromSeconds(5),
+            () => $"node2 never observed node1's incarnation {incarnation2} (sees {(ml2.NodeMap.TryGetValue("node1", out var s) ? s.Incarnation.ToString() : "<none>")})");
+
+        await ml1.UpdateNodeAsync(TimeSpan.FromSeconds(1));
+        var incarnation3 = ml1.Incarnation;
+        await TestHelpers.WaitForConditionAsync(
+            () => ml2.NodeMap.TryGetValue("node1", out var st) && st.Incarnation == incarnation3,
+            TimeSpan.FromSeconds(5),
+            () => $"node2 never observed node1's incarnation {incarnation3} (sees {(ml2.NodeMap.TryGetValue("node1", out var s) ? s.Incarnation.ToString() : "<none>")})");
 
         // Assert: Both calls should increment incarnation (proving broadcast happened)
         incarnation2.Should().Be(incarnation1 + 1);
@@ -266,6 +289,13 @@ public class UpdateNodeTests : IDisposable
         
         // Verify incarnation was incremented (core functionality)
         ml1.Incarnation.Should().BeGreaterThan(0, "incarnation should have incremented");
+
+        // The broadcast that UpdateNode waited for must reach the other node: ml2 sees node1's new incarnation
+        var expectedIncarnation = ml1.Incarnation;
+        await TestHelpers.WaitForConditionAsync(
+            () => ml2.Members().FirstOrDefault(m => m.Name == "node1") is { } n && ml2.NodeMap.TryGetValue("node1", out var st) && st.Incarnation == expectedIncarnation,
+            TimeSpan.FromSeconds(5),
+            () => $"node2 never observed node1's incarnation {expectedIncarnation} (sees {(ml2.NodeMap.TryGetValue("node1", out var s) ? s.Incarnation.ToString() : "<none>")})");
     }
 
     #endregion
@@ -367,8 +397,7 @@ public class UpdateNodeTests : IDisposable
         var ml1 = CreateTestMemberlist("node1", delegate1);
         var ml2 = CreateTestMemberlist("node2");
         
-        // Set event delegate on configs after creation
-        ml1.Config.Events = eventDelegate;
+        // Only the REMOTE node tracks NotifyUpdate so the assertion cannot be satisfied by node1's own update
         ml2.Config.Events = eventDelegate;
 
         await Task.Delay(200);
@@ -377,29 +406,42 @@ public class UpdateNodeTests : IDisposable
         var ml2Port = ml2.Config.BindPort;
         using var joinCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
         await ml1.JoinAsync(new[] { $"127.0.0.1:{ml2Port}" }, joinCts.Token);
-        await Task.Delay(500);
+        await WaitForTwoMembersAsync(ml1, ml2);
+        await TestHelpers.WaitForConditionAsync(
+            () => MetaSeenBy(ml2, "node1") is { } meta && meta.SequenceEqual(metadata1),
+            TimeSpan.FromSeconds(5), "ml2 never learned node1's initial metadata");
 
-        updateNotifications.Clear(); // Clear join notifications
+        lock (updateNotifications) updateNotifications.Clear(); // Clear join notifications
 
         // Act: Update metadata on node1
         currentMeta = metadata2;
         await ml1.UpdateNodeAsync(TimeSpan.FromSeconds(1));
-        await Task.Delay(500); // Wait for event propagation
 
-        // Assert: Verify UpdateNode completed successfully
-        // Note: Event propagation to remote nodes requires full memberlist gossip
-        // which is complex to test reliably. Core UpdateNode functionality is verified
-        // by simpler tests. This test would need more sophisticated cluster setup
-        // and timing to work reliably.
-        
-        // For now, verify that UpdateNode executed without error
+        // Assert: node2's event delegate receives NotifyUpdate for node1 (Go: aliveNode -> NotifyUpdate on meta change)
+        await TestHelpers.WaitForConditionAsync(
+            () => { lock (updateNotifications) return updateNotifications.Contains("node1"); },
+            TimeSpan.FromSeconds(5),
+            "node2 never received NotifyUpdate for node1's metadata change");
+
         ml1.Incarnation.Should().BeGreaterThan(0, "incarnation should have incremented");
         ml1.LocalNode.Meta.Should().BeEquivalentTo(metadata2, "local metadata should be updated");
+        MetaSeenBy(ml2, "node1").Should().BeEquivalentTo(metadata2, "node2 should see node1's updated metadata");
     }
 
     #endregion
 
     #region Test Helpers
+
+    private static Task WaitForTwoMembersAsync(NSerf.Memberlist.Memberlist ml1, NSerf.Memberlist.Memberlist ml2)
+    {
+        return TestHelpers.WaitForConditionAsync(
+            () => ml1.NumMembers() == 2 && ml2.NumMembers() == 2,
+            TimeSpan.FromSeconds(5),
+            () => $"cluster did not converge: ml1={ml1.NumMembers()}, ml2={ml2.NumMembers()}");
+    }
+
+    private static byte[]? MetaSeenBy(NSerf.Memberlist.Memberlist observer, string nodeName) =>
+        observer.Members().FirstOrDefault(m => m.Name == nodeName)?.Meta;
 
     /// <summary>
     /// Test delegate that provides dynamic metadata

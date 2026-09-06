@@ -93,7 +93,9 @@ public class AgentIntegrationTests
         var joined = await client.JoinAsync(new[] { "127.0.0.1:17946" }, false);
         Assert.Equal(1, joined);
 
-        await Task.Delay(500);
+        await NSerfTests.Serf.TestHelpers.WaitForConditionAsync(
+            async () => (await client.MembersAsync()).Length == 2,
+            TimeSpan.FromSeconds(5), () => "RPC members never reported 2 members after join");
 
         var members = await client.MembersAsync();
         Assert.Equal(2, members.Length);

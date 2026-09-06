@@ -42,7 +42,7 @@ public class NSerfServiceProviderAdvancedIntegrationTests(ITestOutputHelper outp
         _providers.Add(provider);
 
         await provider.StartAsync();
-        await Task.Delay(2000);
+        await WaitForInstancesAsync(provider, "api", 3);
 
         var services = await provider.DiscoverServicesAsync();
 
@@ -90,7 +90,9 @@ public class NSerfServiceProviderAdvancedIntegrationTests(ITestOutputHelper outp
         _providers.Add(provider);
 
         await provider.StartAsync();
-        await Task.Delay(2000);
+        await WaitForInstancesAsync(provider, "api", 2);
+        await WaitForInstancesAsync(provider, "postgres", 2);
+        await WaitForInstancesAsync(provider, "redis", 1);
 
         var services = await provider.DiscoverServicesAsync();
 
@@ -113,11 +115,11 @@ public class NSerfServiceProviderAdvancedIntegrationTests(ITestOutputHelper outp
         _providers.Add(provider);
 
         var discoveredEvents = new List<ServiceChangedEventArgs>();
-        provider.ServiceDiscovered += (_, e) => discoveredEvents.Add(e);
+        provider.ServiceDiscovered += (_, e) => { lock (discoveredEvents) discoveredEvents.Add(e); };
 
         await provider.StartAsync();
-        await Task.Delay(1000);
-        discoveredEvents.Clear();
+        await WaitForInstancesAsync(provider, "api", 1);
+        lock (discoveredEvents) discoveredEvents.Clear();
 
         _ = await CreateNodeAsync("node2", 18202, new Dictionary<string, string>
         {
@@ -125,11 +127,14 @@ public class NSerfServiceProviderAdvancedIntegrationTests(ITestOutputHelper outp
             ["port:api"] = "8080"
         }, joinTo: "127.0.0.1:18201");
 
-        await Task.Delay(2000);
+        await WaitForInstancesAsync(provider, "api", 2);
+        await NSerfTests.Serf.TestHelpers.WaitForConditionAsync(
+            () => { lock (discoveredEvents) return discoveredEvents.Count > 0; },
+            TimeSpan.FromSeconds(5), "no ServiceDiscovered event was raised for node2");
 
         var services = await provider.DiscoverServicesAsync();
         Assert.Equal(2, services.First(s => s.Name == "api").Instances.Count);
-        Assert.NotEmpty(discoveredEvents);
+        lock (discoveredEvents) Assert.NotEmpty(discoveredEvents);
     }
 
     [Fact]
@@ -151,10 +156,10 @@ public class NSerfServiceProviderAdvancedIntegrationTests(ITestOutputHelper outp
         _providers.Add(provider);
 
         await provider.StartAsync();
-        await Task.Delay(2000);
+        await WaitForInstancesAsync(provider, "api", 2);
 
         await node2.LeaveAsync();
-        await Task.Delay(2000);
+        await WaitForInstancesAsync(provider, "api", 1);
 
         var services = await provider.DiscoverServicesAsync();
         Assert.Single(services.First(s => s.Name == "api").Instances);
@@ -181,7 +186,7 @@ public class NSerfServiceProviderAdvancedIntegrationTests(ITestOutputHelper outp
         _providers.Add(provider);
 
         await provider.StartAsync();
-        await Task.Delay(2000);
+        await WaitForInstancesAsync(provider, "postgres", 2);
 
         var services = await provider.DiscoverServicesAsync();
         var postgresService = services.First(s => s.Name == "postgres");
@@ -214,7 +219,8 @@ public class NSerfServiceProviderAdvancedIntegrationTests(ITestOutputHelper outp
         _providers.Add(provider);
 
         await provider.StartAsync();
-        await Task.Delay(2000);
+        await WaitForInstancesAsync(provider, "rabbitmq", 2);
+        await WaitForInstancesAsync(provider, "rabbitmq-mgmt", 2);
 
         var services = await provider.DiscoverServicesAsync();
 
@@ -244,7 +250,7 @@ public class NSerfServiceProviderAdvancedIntegrationTests(ITestOutputHelper outp
         _providers.Add(provider);
 
         await provider.StartAsync();
-        await Task.Delay(2000);
+        await WaitForInstancesAsync(provider, "api", 2);
 
         var services = await provider.DiscoverServicesAsync();
         var instances = services.First(s => s.Name == "api").Instances;
@@ -281,7 +287,9 @@ public class NSerfServiceProviderAdvancedIntegrationTests(ITestOutputHelper outp
         _providers.Add(provider);
 
         await provider.StartAsync();
-        await Task.Delay(2000);
+        await WaitForInstancesAsync(provider, "web", 1);
+        await WaitForInstancesAsync(provider, "api", 1);
+        await WaitForInstancesAsync(provider, "rpc", 1);
 
         var services = await provider.DiscoverServicesAsync();
 
@@ -311,7 +319,9 @@ public class NSerfServiceProviderAdvancedIntegrationTests(ITestOutputHelper outp
         };
 
         await provider.StartAsync();
-        await Task.Delay(2000);
+        await NSerfTests.Serf.TestHelpers.WaitForConditionAsync(
+            () => registry.GetServices().Any(s => s.Name == "api"),
+            TimeSpan.FromSeconds(5), "registry never received the 'api' service from the provider");
 
         var registryServices = registry.GetServices();
         Assert.True(registryServices.Any(s => s.Name == "api"), "Registry should contain 'api' service");
@@ -353,7 +363,7 @@ public class NSerfServiceProviderAdvancedIntegrationTests(ITestOutputHelper outp
         _providers.Add(provider);
 
         await provider.StartAsync();
-        await Task.Delay(2000);
+        await WaitForServiceCountAsync(provider, 4);
 
         var services = await provider.DiscoverServicesAsync();
 
@@ -385,7 +395,7 @@ public class NSerfServiceProviderAdvancedIntegrationTests(ITestOutputHelper outp
         _providers.Add(provider);
 
         await provider.StartAsync();
-        await Task.Delay(3000);
+        await WaitForServiceCountAsync(provider, 5);
 
         var discoveredServices = await provider.DiscoverServicesAsync();
 
@@ -394,6 +404,26 @@ public class NSerfServiceProviderAdvancedIntegrationTests(ITestOutputHelper outp
     }
 
     #region Helper Methods
+
+    /// <summary>Polls the provider until <paramref name="serviceName"/> reports exactly <paramref name="count"/> instances.</summary>
+    private static Task WaitForInstancesAsync(NSerfServiceProvider provider, string serviceName, int count)
+    {
+        return NSerfTests.Serf.TestHelpers.WaitForConditionAsync(
+            async () => (await provider.DiscoverServicesAsync()).FirstOrDefault(s => s.Name == serviceName)?.Instances.Count == count,
+            TimeSpan.FromSeconds(10),
+            () => $"service '{serviceName}' did not reach {count} instances; provider sees " +
+                  $"[{string.Join(", ", provider.DiscoverServicesAsync().GetAwaiter().GetResult().Select(s => $"{s.Name}x{s.Instances.Count}"))}]");
+    }
+
+    /// <summary>Polls the provider until it reports exactly <paramref name="count"/> distinct services.</summary>
+    private static Task WaitForServiceCountAsync(NSerfServiceProvider provider, int count)
+    {
+        return NSerfTests.Serf.TestHelpers.WaitForConditionAsync(
+            async () => (await provider.DiscoverServicesAsync()).Count == count,
+            TimeSpan.FromSeconds(10),
+            () => $"provider did not reach {count} services; sees " +
+                  $"[{string.Join(", ", provider.DiscoverServicesAsync().GetAwaiter().GetResult().Select(s => s.Name))}]");
+    }
 
     private async Task<NSerf.Serf.Serf> CreateNodeAsync(string nodeName, int port,
         Dictionary<string, string> tags, string? joinTo = null)

@@ -8,6 +8,7 @@ using NSerf.Memberlist;
 using NSerf.Memberlist.Configuration;
 using NSerf.Memberlist.State;
 using NSerf.Memberlist.Transport;
+using NSerfTests.Serf;
 using Xunit;
 
 namespace NSerfTests.Memberlist;
@@ -58,6 +59,14 @@ public class TcpFallbackTests : IAsyncLifetime
         return config;
     }
     
+    private static Task WaitForTwoMembersAsync(NSerf.Memberlist.Memberlist m1, NSerf.Memberlist.Memberlist m2)
+    {
+        return TestHelpers.WaitForConditionAsync(
+            () => m1.NumMembers() == 2 && m2.NumMembers() == 2,
+            TimeSpan.FromSeconds(5),
+            () => $"cluster did not converge: m1={m1.NumMembers()}, m2={m2.NumMembers()}");
+    }
+
     private NSerf.Memberlist.Memberlist CreateMemberlistAsync(MemberlistConfig config)
     {
         // Create real network transport
@@ -102,7 +111,7 @@ public class TcpFallbackTests : IAsyncLifetime
         error.Should().BeNull();
         numJoined.Should().Be(1);
         
-        await Task.Delay(500);
+        await WaitForTwoMembersAsync(m1, m2);
         
         // Both should see 2 members
         m1.NumMembers().Should().Be(2);
@@ -155,7 +164,7 @@ public class TcpFallbackTests : IAsyncLifetime
         error.Should().BeNull();
         numJoined.Should().Be(1);
         
-        await Task.Delay(500);
+        await WaitForTwoMembersAsync(m1, m2);
         
         // Both should see 2 members initially
         m1.NumMembers().Should().Be(2);
@@ -194,7 +203,7 @@ public class TcpFallbackTests : IAsyncLifetime
         error.Should().BeNull();
         numJoined.Should().Be(1);
         
-        await Task.Delay(500);
+        await WaitForTwoMembersAsync(m1, m2);
         
         // Both should see 2 members initially
         m1.NumMembers().Should().Be(2);
@@ -230,7 +239,7 @@ public class TcpFallbackTests : IAsyncLifetime
         using var joinCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         await m2.JoinAsync([joinAddr], joinCts.Token);
         
-        await Task.Delay(500);
+        await WaitForTwoMembersAsync(m1, m2);
         
         // Verify protocol versions support TCP fallback (>= 3)
         lock (m1.NodeLock)
@@ -282,7 +291,7 @@ public class TcpFallbackTests : IAsyncLifetime
         numJoined.Should().Be(1);
         
         // Wait for convergence
-        await Task.Delay(500);
+        await WaitForTwoMembersAsync(m1, m2);
         
         m1.NumMembers().Should().Be(2, "m1 should see both nodes");
         m2.NumMembers().Should().Be(2, "m2 should see both nodes");

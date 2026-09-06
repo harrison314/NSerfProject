@@ -1,6 +1,6 @@
 // Copyright (c) BoolHak, Inc.
 // SPDX-License-Identifier: MPL-2.0
-// Phase 9.6: Query System Implementation
+// Ported from: github.com/hashicorp/serf/serf/query.go and serf.go (handleQuery/handleQueryResponse)
 
 using System.Text;
 using MessagePack;
@@ -15,7 +15,7 @@ public partial class Serf
     /// Protocol version 4 or higher is required.
     /// Maps to: Go's Query() method
     /// </summary>
-    public async Task<QueryResponse> QueryAsync(string name, byte[] payload, QueryParam? parameters = null)
+    public Task<QueryResponse> QueryAsync(string name, byte[] payload, QueryParam? parameters = null)
     {
         // Check that the latest protocol is in use
         if (Config.ProtocolVersion < 4)
@@ -89,10 +89,10 @@ public partial class Serf
         HandleQuery(q);
 
         // Start broadcasting the query
-        Logger?.LogInformation("[Serf/Query] Queuing query '{Name}' for broadcast ({Size} bytes)", name, raw.Length);
-        await QueryBroadcasts.QueueBytesAsync(raw);
+        Logger?.LogDebug("[Serf/Query] Queuing query '{Name}' for broadcast ({Size} bytes)", name, raw.Length);
+        QueryBroadcasts.QueueBytes(raw);
 
-        return await Task.FromResult(resp);
+        return Task.FromResult(resp);
     }
 
     /// <summary>
@@ -164,6 +164,16 @@ public partial class Serf
                 seen = new QueryCollection { LTime = query.LTime };
                 seen.QueryIDs.Add(query.ID);
                 QueryBuffer[query.LTime] = seen;
+
+                // Go uses a fixed-size ring indexed by LTime; keep only the last QueryBuffer ticks here
+                if (QueryBuffer.Count > Config.QueryBuffer && curTime > bufferSize)
+                {
+                    var cutoff = curTime - bufferSize;
+                    foreach (var stale in QueryBuffer.Keys.Where(k => k < cutoff).ToList())
+                    {
+                        QueryBuffer.Remove(stale);
+                    }
+                }
             }
 
             // Emit metrics

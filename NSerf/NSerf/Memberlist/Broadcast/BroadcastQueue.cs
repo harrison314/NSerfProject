@@ -18,14 +18,25 @@ public class BroadcastQueue(TransmitLimitedQueue queue)
     }
 
     /// <summary>
-    /// Queues a broadcast with completion notification.
-    /// Returns a task that completes when the broadcast is sent.
+    /// Queues a broadcast and waits until it has been transmitted the configured number of
+    /// times (or was invalidated by a newer broadcast), bounded by <paramref name="timeout"/>.
+    /// Returns true if the broadcast finished before the timeout, false otherwise.
+    /// Mirrors Go's pattern of queueing a broadcast with a notify channel and selecting on it.
     /// </summary>
-    public Task QueueBytesAsync(byte[] data)
+    public async Task<bool> QueueBytesAsync(byte[] data, TimeSpan timeout, CancellationToken cancellationToken = default)
     {
-        queue.QueueBroadcast(new SimpleBroadcast(data));
+        var notifier = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        queue.QueueBroadcast(new NotifyingBroadcast(data, notifier));
 
-        return Task.CompletedTask;
+        try
+        {
+            await notifier.Task.WaitAsync(timeout, cancellationToken);
+            return true;
+        }
+        catch (TimeoutException)
+        {
+            return false;
+        }
     }
 
     /// <summary>

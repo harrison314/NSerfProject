@@ -55,7 +55,7 @@ internal class Delegate(Serf serf) : IDelegate
         var rebroadcastQueue = _serf.Broadcasts;
         var messageType = (MessageType)message[0];
 
-        _serf.Logger?.LogInformation("[Serf.Delegate] *** Received message type: {Type}, length: {Length} ***", messageType, message.Length);
+        _serf.Logger?.LogTrace("[Serf.Delegate] *** Received message type: {Type}, length: {Length} ***", messageType, message.Length);
 
         // Check if a message should be dropped (for testing)
         if (_serf.Config.ShouldDropMessage(messageType))
@@ -114,8 +114,8 @@ internal class Delegate(Serf serf) : IDelegate
                 break;
 
             case MessageType.Relay:
-                // Synchronously wait for relay forwarding to complete
-                HandleRelayMessage(message[1..].ToArray()).GetAwaiter().GetResult();
+                // Forwarding happens in the background so the packet loop is never blocked
+                HandleRelayMessage(message[1..].ToArray());
                 break;
 
             default:
@@ -131,18 +131,29 @@ internal class Delegate(Serf serf) : IDelegate
     }
 
     /// <summary>
+    /// Splits a relay payload (the bytes following the Serf Relay type byte) into its
+    /// decoded <see cref="RelayHeader"/> and the inner message that follows it
+    /// ([Serf MessageType][MessagePack payload]).
+    /// </summary>
+    internal static (RelayHeader Header, byte[] Inner) SplitRelayPayload(byte[] payload)
+    {
+        // Decode straight from the buffer and use the reader's consumed count, so any valid
+        // (even non-canonical) encoding of the header yields the correct split.
+        var reader = new MessagePackReader(payload);
+        var header = MessagePackSerializer.Deserialize<RelayHeader>(ref reader, MessagePackSerializerOptions.Standard);
+        var headerSize = checked((int)reader.Consumed);
+        return (header, payload[headerSize..]);
+    }
+
+    /// <summary>
     /// Handles relay messages which forward messages to specific destination nodes.
     /// </summary>
-    private async Task HandleRelayMessage(byte[] payload)
+    private void HandleRelayMessage(byte[] payload)
     {
         try
         {
-            // Decode the relay header
-            var header = MessagePackSerializer.Deserialize<RelayHeader>(payload);
-
-            // The remaining contents are the message itself: [Serf MessageType][MessagePack payload]
-            var headerSize = MessagePackSerializer.Serialize(header).Length;
-            var inner = payload[headerSize..].ToArray();
+            // Decode the relay header and locate the inner message
+            var (header, inner) = SplitRelayPayload(payload);
 
             // Sanity: need at least 1 byte for a Serf message type
             if (inner.Length == 0)
@@ -166,8 +177,19 @@ internal class Delegate(Serf serf) : IDelegate
 
             _serf.Logger?.LogDebug("[Serf] Relaying message to {Addr} (name={Name})", dest.Addr, dest.Name);
 
-            // Forward to destination and await completion
-            await _serf.Memberlist!.SendToAddress(dest, forwardBuf);
+            // Forward to destination without blocking the caller (fire-and-forget, errors logged)
+            var memberlist = _serf.Memberlist!;
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await memberlist.SendToAddress(dest, forwardBuf);
+                }
+                catch (Exception ex)
+                {
+                    _serf.Logger?.LogError(ex, "[Serf] Error forwarding relayed message to {Addr}", dest.Addr);
+                }
+            });
         }
         catch (Exception ex)
         {
@@ -181,11 +203,11 @@ internal class Delegate(Serf serf) : IDelegate
     /// </summary>
     public List<byte[]> GetBroadcasts(int overhead, int limit)
     {
-        _serf.Logger?.LogInformation("[Serf.Delegate] *** GetBroadcasts called with overhead={Overhead}, limit={Limit} ***", overhead, limit);
+        _serf.Logger?.LogTrace("[Serf.Delegate] *** GetBroadcasts called with overhead={Overhead}, limit={Limit} ***", overhead, limit);
 
         // Get regular broadcasts
         var messages = _serf.Broadcasts.GetBroadcasts(overhead, limit);
-        _serf.Logger?.LogInformation("[Serf.Delegate] Regular broadcasts: {Count}", messages.Count);
+        _serf.Logger?.LogTrace("[Serf.Delegate] Regular broadcasts: {Count}", messages.Count);
 
         // Determine the bytes used already
         var bytesUsed = 0;
@@ -198,14 +220,14 @@ internal class Delegate(Serf serf) : IDelegate
         // Get query broadcasts
         var availForQueries = limit - bytesUsed;
         var queryQueueCount = _serf.QueryBroadcasts.Count;
-        _serf.Logger?.LogInformation("[Serf.Delegate] *** Calling QueryBroadcasts.GetBroadcasts(overhead={OH}, limit={LIM}), queue has {QCount} items ***", overhead, availForQueries, queryQueueCount);
+        _serf.Logger?.LogTrace("[Serf.Delegate] *** Calling QueryBroadcasts.GetBroadcasts(overhead={OH}, limit={LIM}), queue has {QCount} items ***", overhead, availForQueries, queryQueueCount);
 
         var queryMessages = _serf.QueryBroadcasts.GetBroadcasts(overhead, availForQueries);
-        _serf.Logger?.LogInformation("[Serf.Delegate] *** QueryBroadcasts returned {Count} messages (had {QCount} queued, {Avail} bytes available) ***", queryMessages.Count, queryQueueCount, availForQueries);
+        _serf.Logger?.LogTrace("[Serf.Delegate] *** QueryBroadcasts returned {Count} messages (had {QCount} queued, {Avail} bytes available) ***", queryMessages.Count, queryQueueCount, availForQueries);
 
         if (queryMessages.Count > 0)
         {
-            _serf.Logger?.LogInformation("[Serf.Delegate] *** Adding {Count} query broadcasts to send ***", queryMessages.Count);
+            _serf.Logger?.LogTrace("[Serf.Delegate] *** Adding {Count} query broadcasts to send ***", queryMessages.Count);
             foreach (var m in queryMessages)
             {
                 bytesUsed += m.Length + overhead;
@@ -215,14 +237,14 @@ internal class Delegate(Serf serf) : IDelegate
         }
         else if (queryQueueCount > 0)
         {
-            _serf.Logger?.LogWarning("[Serf.Delegate] *** {QCount} queries queued but GetBroadcasts returned 0! Avail bytes: {Avail} ***", queryQueueCount, availForQueries);
+            _serf.Logger?.LogDebug("[Serf.Delegate] *** {QCount} queries queued but GetBroadcasts returned 0! Avail bytes: {Avail} ***", queryQueueCount, availForQueries);
         }
 
         // Get event broadcasts
         var eventMessages = _serf.EventBroadcasts.GetBroadcasts(overhead, limit - bytesUsed);
         if (eventMessages.Count > 0)
         {
-            _serf.Logger?.LogInformation("[Serf.Delegate] *** Retrieved {Count} event broadcasts ***", eventMessages.Count);
+            _serf.Logger?.LogTrace("[Serf.Delegate] *** Retrieved {Count} event broadcasts ***", eventMessages.Count);
             foreach (var m in eventMessages)
             {
                 bytesUsed += m.Length + overhead;

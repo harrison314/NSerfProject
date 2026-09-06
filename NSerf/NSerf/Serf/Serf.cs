@@ -1,6 +1,6 @@
 // Copyright (c) BoolHak, Inc.
 // SPDX-License-Identifier: MPL-2.0
-// Partial implementation for Phase 6 (Delegates) - will be expanded in Phase 9
+// Ported from: github.com/hashicorp/serf/serf/serf.go
 
 using Microsoft.Extensions.Logging;
 using NSerf.Memberlist;
@@ -15,7 +15,7 @@ namespace NSerf.Serf;
 
 /// <summary>
 /// Main Serf class for cluster membership and coordination.
-/// Partial implementation supporting Delegate operations - will be fully implemented in Phase 9.
+/// Maps to Go's serf.Serf.
 /// </summary>
 public partial class Serf : IDisposable, IAsyncDisposable
 {
@@ -36,7 +36,8 @@ public partial class Serf : IDisposable, IAsyncDisposable
     internal readonly IMemberManager MemberManager;
     internal EventManager? EventManager;
     private SerfMetricsRecorder? _metricsRecorder;
-    private SerfQueryHelper? _queryHelper; internal bool EventJoinIgnore { get; set; }
+    private SerfQueryHelper? _queryHelper;
+    internal bool EventJoinIgnore { get; set; }
     internal LamportTime QueryMinTime { get; set; }
     private readonly Dictionary<LamportTime, QueryResponse> _queryResponses = [];
     private readonly Random _queryRandom = new();
@@ -127,6 +128,13 @@ public partial class Serf : IDisposable, IAsyncDisposable
     /// Thread-safe read operation using the MemberManager transaction pattern.
     /// </summary>
     public int NumMembers() => MemberManager.ExecuteUnderLock(accessor => accessor.GetMemberCount());
+
+    /// <summary>
+    /// Returns true if at least one other member is currently alive.
+    /// Maps to: Go's hasAliveMembers()
+    /// </summary>
+    internal bool HasAliveMembers() => MemberManager.ExecuteUnderLock(accessor =>
+        accessor.GetMembersByStatus(MemberStatus.Alive).Any(m => m.Name != Config.NodeName));
 
     /// <summary>
     /// Sets a member using the MemberManager transaction pattern.
@@ -311,16 +319,25 @@ public partial class Serf : IDisposable, IAsyncDisposable
             // DefaultLANConfig() sets Name = Environment.MachineName, so ALWAYS override with Serf's NodeName
             config.MemberlistConfig.Name = config.NodeName;
 
-            serf._eventDelegate = new SerfEventDelegate(serf);
+            // Wire the memberlist delegates and protocol versions (Go: serf.Create)
+            serf._eventDelegate = new EventDelegate(serf);
             config.MemberlistConfig.Events = serf._eventDelegate;
-            var serfDelegate = new Delegate(serf);
-            config.MemberlistConfig.Delegate = serfDelegate;
+            config.MemberlistConfig.Conflict = new ConflictDelegate(serf);
+            config.MemberlistConfig.Delegate = new Delegate(serf);
+            config.MemberlistConfig.DelegateProtocolVersion = config.ProtocolVersion;
+            config.MemberlistConfig.DelegateProtocolMin = ProtocolVersionMin;
+            config.MemberlistConfig.DelegateProtocolMax = ProtocolVersionMax;
+            config.MemberlistConfig.ProtocolVersion = ProtocolVersionMap.Mapping[config.ProtocolVersion];
 
             if (!config.DisableCoordinates)
             {
-                var pingDelegate = new PingDelegate(serf);
-                config.MemberlistConfig.Ping = pingDelegate;
+                config.MemberlistConfig.Ping = new PingDelegate(serf);
                 serf.Logger?.LogInformation("[Serf/Coordinates] ✓ PingDelegate configured for RTT tracking");
+            }
+
+            if (config.Merge != null)
+            {
+                config.MemberlistConfig.Merge = new MergeDelegate(serf);
             }
 
             if (config.MemberlistConfig.Transport == null)
@@ -382,11 +399,10 @@ public partial class Serf : IDisposable, IAsyncDisposable
             serf.Logger?.LogInformation("[Serf/AutoRejoin] Starting auto-rejoin task for {Count} nodes", previousNodes.Count);
 
             // Synchronous best-effort attempt before returning
-            // This ensures refutation happens during CreateAsync, making tests deterministic
+            // This ensures refutation happens during CreateAsync, making tests deterministic.
+            // No delay is needed: Memberlist.Create has already started its listeners.
             try
             {
-                // Increased delay to allow memberlist to fully initialize
-                await Task.Delay(1000);
                 var addrs = previousNodes
                     .Where(n => !string.Equals(n.Name, config.NodeName, StringComparison.Ordinal))
                     .Select(n => n.Addr)
@@ -514,6 +530,16 @@ public partial class Serf : IDisposable, IAsyncDisposable
     public async Task SetTagsAsync(Dictionary<string, string>? tags)
     {
         ArgumentNullException.ThrowIfNull(tags);
+
+        // Reject oversized tags before touching the config (Go: SetTags checks memberlist.MetaMaxSize)
+        var encoded = EncodeTags(tags);
+        if (encoded.Length > NSerf.Memberlist.Messages.MessageConstants.MetaMaxSize)
+        {
+            throw new ArgumentException(
+                $"Encoded length of tags exceeds limit of {NSerf.Memberlist.Messages.MessageConstants.MetaMaxSize} bytes",
+                nameof(tags));
+        }
+
         Config.Tags = new Dictionary<string, string>(tags);
         if (Memberlist != null)
             await Memberlist.UpdateNodeAsync(Config.BroadcastTimeout);
@@ -572,7 +598,7 @@ public partial class Serf : IDisposable, IAsyncDisposable
 
         EventClock.Increment();
         HandleUserEvent(msg);
-        Logger?.LogInformation("[Serf] *** Queuing user event '{Name}' ({Size} bytes) for broadcast ***", name, raw.Length);
+        Logger?.LogDebug("[Serf] Queuing user event '{Name}' ({Size} bytes) for broadcast", name, raw.Length);
         EventBroadcasts.QueueBytes(raw);
 
         return Task.CompletedTask;
@@ -666,8 +692,18 @@ public partial class Serf : IDisposable, IAsyncDisposable
             var encoded = EncodeMessage(MessageType.Leave, leaveMsg);
             if (encoded.Length > 0)
             {
-                await Broadcasts.QueueBytesAsync(encoded);
-                Logger?.LogDebug("[Serf] Broadcasted leave intent for: {Node}", Config.NodeName);
+                // Wait for the leave intent to go out, but only if there is anyone to tell (Go: Leave)
+                if (HasAliveMembers())
+                {
+                    if (await Broadcasts.QueueBytesAsync(encoded, Config.BroadcastTimeout))
+                        Logger?.LogDebug("[Serf] Broadcasted leave intent for: {Node}", Config.NodeName);
+                    else
+                        Logger?.LogWarning("[Serf] Timed out broadcasting leave intent for: {Node}", Config.NodeName);
+                }
+                else
+                {
+                    Broadcasts.QueueBytes(encoded);
+                }
             }
 
             if (Memberlist != null)
@@ -798,7 +834,8 @@ public partial class Serf : IDisposable, IAsyncDisposable
     /// </summary>
     /// <param name="nodeName">Name of the node to remove</param>
     /// <param name="prune">If true, also prune from the snapshot</param>
-    /// <returns>True if a node was removed, false if not found</returns>
+    /// <returns>True once the removal intent has been processed and broadcast (like Go, this does not report whether the node was known)</returns>
+    /// <exception cref="TimeoutException">Thrown if the removal could not be broadcast within <see cref="Config.BroadcastTimeout"/></exception>
     public async Task<bool> RemoveFailedNodeAsync(string? nodeName, bool prune = false)
     {
         ArgumentException.ThrowIfNullOrEmpty(nodeName);
@@ -815,12 +852,17 @@ public partial class Serf : IDisposable, IAsyncDisposable
 
         HandleNodeLeaveIntent(leaveMsg);
 
-        if (Memberlist != null && Memberlist.NumMembers() > 1)
+        // If nobody else is alive there is nobody to tell (Go: forceLeave)
+        if (!HasAliveMembers())
         {
-            var encoded = EncodeMessage(MessageType.Leave, leaveMsg);
-            // Use QueueBytes (not QueueBytesAsync) - a simple fire-and-forget broadcast
-            await Broadcasts.QueueBytesAsync(encoded);
-            await Task.Delay(Config.BroadcastTimeout);
+            Logger?.LogInformation("[Serf] Removed failed node: {NodeName}", nodeName);
+            return true;
+        }
+
+        var encoded = EncodeMessage(MessageType.Leave, leaveMsg);
+        if (encoded.Length > 0 && !await Broadcasts.QueueBytesAsync(encoded, Config.BroadcastTimeout))
+        {
+            throw new TimeoutException("timed out broadcasting node removal");
         }
 
         Logger?.LogInformation("[Serf] Removed failed node: {NodeName}", nodeName);
@@ -1139,10 +1181,16 @@ public partial class Serf : IDisposable, IAsyncDisposable
             return _coordClient.GetCoordinate();
         }
 
-        // For other nodes, check cache
-        lock (_coordCacheLock)
+        // For other nodes, check the cache. This must take the reader side of the
+        // ReaderWriterLockSlim; using Monitor (lock) on it does not synchronize with UpdateCoordinate.
+        _coordCacheLock.EnterReadLock();
+        try
         {
             return _coordCache.GetValueOrDefault(nodeName);
+        }
+        finally
+        {
+            _coordCacheLock.ExitReadLock();
         }
     }
 

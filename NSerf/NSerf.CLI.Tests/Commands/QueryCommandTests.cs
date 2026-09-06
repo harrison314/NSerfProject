@@ -21,7 +21,8 @@ public class QueryCommandTests
         var rootCommand = new RootCommand();
         rootCommand.Add(QueryCommand.Create());
 
-        var args = new[] { "query", "--rpc-addr", fixture.RpcAddr!, "test-query" };
+        // The command runs until the query is done (Go semantics), so keep the query timeout short
+        var args = new[] { "query", "--rpc-addr", fixture.RpcAddr!, "--timeout", "1", "test-query" };
 
         var (exitCode, output, error) = await CommandTestHelper.ExecuteCommandAsync(rootCommand, args);
 
@@ -33,5 +34,44 @@ public class QueryCommandTests
         }
         Assert.Equal(0, exitCode);
         Assert.Contains("Query 'test-query' dispatched", output);
+    }
+
+    /// <summary>
+    /// Port of Go's 'serf query' text output: acks and responses are printed as they arrive
+    /// and totals are printed once the query is done.
+    /// </summary>
+    [Fact(Timeout = 15000)]
+    public async Task QueryCommand_PrintsAcksResponsesAndTotals()
+    {
+        await using var fixture = new AgentFixture();
+        await fixture.InitializeAsync();
+
+        var responder = new QueryResponder(System.Text.Encoding.UTF8.GetBytes("pong"));
+        fixture.Agent!.RegisterEventHandler(responder);
+
+        var rootCommand = new RootCommand();
+        rootCommand.Add(QueryCommand.Create());
+
+        var args = new[] { "query", "--rpc-addr", fixture.RpcAddr!, "--timeout", "2", "test-query", "ping" };
+
+        var (exitCode, output, error) = await CommandTestHelper.ExecuteCommandAsync(rootCommand, args);
+
+        Assert.True(exitCode == 0, $"exit code {exitCode}, output: {output}, error: {error}");
+        var nodeName = fixture.Agent.NodeName;
+        Assert.Contains($"Ack from '{nodeName}'", output);
+        Assert.Contains($"Response from '{nodeName}': pong", output);
+        Assert.Contains("Total Acks: 1", output);
+        Assert.Contains("Total Responses: 1", output);
+    }
+
+    private sealed class QueryResponder(byte[] payload) : NSerf.Agent.IEventHandler
+    {
+        public void HandleEvent(NSerf.Serf.Events.IEvent @event)
+        {
+            if (@event is NSerf.Serf.Events.Query query)
+            {
+                _ = query.RespondAsync(payload);
+            }
+        }
     }
 }

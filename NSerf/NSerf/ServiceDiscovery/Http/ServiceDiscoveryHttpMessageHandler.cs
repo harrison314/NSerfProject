@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Logging;
+using System.Collections.Concurrent;
 using System.Net;
 
 namespace NSerf.ServiceDiscovery.Http;
@@ -22,6 +23,10 @@ public sealed class ServiceDiscoveryHttpMessageHandler : DelegatingHandler
     private readonly IServiceRegistry _registry;
     private readonly ILogger<ServiceDiscoveryHttpMessageHandler>? _logger;
     private readonly ServiceDiscoveryHttpOptions _options;
+
+    // Per-service request counters shared by all handler instances (HttpClientFactory creates
+    // a handler per client/pool entry, so the counter must not live on the instance).
+    private static readonly ConcurrentDictionary<string, int> RoundRobinCounters = new();
 
     /// <summary>
     /// Creates a new service discovery HTTP message handler.
@@ -131,7 +136,7 @@ public sealed class ServiceDiscoveryHttpMessageHandler : DelegatingHandler
         // Use load balancing strategy
         var selected = _options.LoadBalancingStrategy switch
         {
-            LoadBalancingStrategy.RoundRobin => SelectRoundRobin(instances),
+            LoadBalancingStrategy.RoundRobin => SelectRoundRobin(serviceName, instances),
             LoadBalancingStrategy.Random => SelectRandom(instances),
             LoadBalancingStrategy.WeightedRandom => SelectWeightedRandom(instances),
             _ => instances[0]
@@ -140,11 +145,13 @@ public sealed class ServiceDiscoveryHttpMessageHandler : DelegatingHandler
         return Task.FromResult<ServiceInstance?>(selected);
     }
 
-    private static ServiceInstance SelectRoundRobin(IReadOnlyList<ServiceInstance> instances)
+    private static ServiceInstance SelectRoundRobin(string serviceName, IReadOnlyList<ServiceInstance> instances)
     {
-        // Simple round-robin using timestamp
-        var index = (int)(DateTime.UtcNow.Ticks % instances.Count);
-        return instances[index];
+        // A per-service atomic counter gives true round-robin. The previous implementation used
+        // DateTime.UtcNow.Ticks % count, which is not round-robin at all and, on platforms with
+        // microsecond clock resolution (macOS), always picked the same instance out of two.
+        var counter = RoundRobinCounters.AddOrUpdate(serviceName, 0, (_, current) => unchecked(current + 1));
+        return instances[(int)((uint)counter % (uint)instances.Count)];
     }
 
     private static ServiceInstance SelectRandom(IReadOnlyList<ServiceInstance> instances)
@@ -209,7 +216,7 @@ public sealed class ServiceDiscoveryHttpOptions
     /// Whether to resolve FQDNs (hosts with dots) as service names.
     /// Default is false.
     /// </summary>
-    public bool ResolveFqdns { get; init; }
+    public bool ResolveFqdns { get; set; }
 
     /// <summary>
     /// Whether to throw an exception when no healthy endpoints are found.

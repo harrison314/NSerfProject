@@ -37,9 +37,6 @@ public class SerfAgent : IAsyncDisposable
     /// <summary>
     /// Gets the node name for this agent.
     /// </summary>
-    /// <summary>
-    /// Gets the node name for this agent.
-    /// </summary>
     public string NodeName => _config.NodeName;
 
     /// <summary>
@@ -47,6 +44,20 @@ public class SerfAgent : IAsyncDisposable
     /// Useful for real-time monitoring without implementing IEventHandler.
     /// </summary>
     public event Action<IEvent>? EventReceived;
+
+    /// <summary>
+    /// Raised (with the number of attempts made) when the background retry-join loop gives up because
+    /// <see cref="AgentConfig.RetryMaxAttempts"/> was reached without joining anyone. Maps to Go's
+    /// retryJoinErrCh in command.go: the agent runner exits with code 1 when it fires. Never raised
+    /// when RetryMaxAttempts is 0 (retry forever).
+    /// </summary>
+    public event Action<int>? RetryJoinExhausted;
+
+    /// <summary>
+    /// Actual address the RPC server is listening on (resolved port when RpcAddr used port 0), or
+    /// null while no RPC server is running.
+    /// </summary>
+    public string? RpcAddress => _rpcServer?.Address;
 
     private static readonly JsonSerializerOptions JsonSerializerOptions = new()
     {
@@ -56,7 +67,6 @@ public class SerfAgent : IAsyncDisposable
     public SerfAgent(AgentConfig config, ILogger? logger = null)
     {
         _config = config ?? throw new ArgumentNullException(nameof(config));
-        _logger = logger;
 
         // Validate mutual exclusions
         if (_config.Tags.Count > 0 && !string.IsNullOrEmpty(_config.TagsFile))
@@ -75,8 +85,11 @@ public class SerfAgent : IAsyncDisposable
             FullMode = BoundedChannelFullMode.Wait
         });
 
-        // Create a circular log writer (buffer default size=512)
+        // Create a circular log writer (buffer default size=512) and route all agent, Serf and
+        // memberlist log lines through it so the `monitor` RPC command has something to stream.
         LogWriter = new CircularLogWriter();
+        var monitorLevel = string.IsNullOrEmpty(_config.LogLevel) ? LogLevel.Info : LogLevelExtensions.FromString(_config.LogLevel);
+        _logger = new MonitorLogForwarder(logger, LogWriter, monitorLevel);
     }
 
     public async Task StartAsync(CancellationToken cancellationToken = default)
@@ -133,8 +146,8 @@ public class SerfAgent : IAsyncDisposable
         var distinctStartTargets = startJoinTargets.Distinct().ToArray();
         if (distinctStartTargets.Length > 0)
         {
-            const bool ignoreOld = true;  // Default: don't replay old events
-            var joined = await Serf.JoinAsync(distinctStartTargets, ignoreOld);
+            // Honour ReplayOnJoin like the retry-join path does (Go: agent.Join(..., c.Config.ReplayOnJoin))
+            var joined = await Serf.JoinAsync(distinctStartTargets, ignoreOld: !_config.ReplayOnJoin);
             if (joined == 0)
             {
                 _logger?.LogWarning("[Agent] Failed to join any nodes");
@@ -562,6 +575,7 @@ public class SerfAgent : IAsyncDisposable
             if (maxAttempts > 0 && attempt >= maxAttempts)
             {
                 _logger?.LogWarning("[Agent] Retry join failed after {Attempts} attempts", attempt);
+                NotifyRetryJoinExhausted(attempt);
                 return;
             }
 
@@ -574,6 +588,18 @@ public class SerfAgent : IAsyncDisposable
             {
                 return; // Shutdown requested
             }
+        }
+    }
+
+    private void NotifyRetryJoinExhausted(int attempts)
+    {
+        try
+        {
+            RetryJoinExhausted?.Invoke(attempts);
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogError(ex, "[Agent] RetryJoinExhausted listener threw exception");
         }
     }
 
@@ -609,9 +635,17 @@ public class SerfAgent : IAsyncDisposable
     }
 
     /// <summary>
-    /// Gracefully shutdown the agent. Idempotent - can be called multiple times.
+    /// Gracefully shutdown the agent (leaves the cluster first). Idempotent - can be called multiple times.
     /// </summary>
-    public async Task ShutdownAsync()
+    public Task ShutdownAsync() => ShutdownAsync(leave: true);
+
+    /// <summary>
+    /// Shuts the agent down. With <paramref name="leave"/> = true the agent broadcasts a graceful leave
+    /// first (the node becomes "left"); with false it stops without leaving, so the cluster detects the
+    /// node as failed (Go: agent.Shutdown() after a forced exit such as SIGTERM without leave_on_terminate).
+    /// Idempotent - can be called multiple times.
+    /// </summary>
+    public async Task ShutdownAsync(bool leave)
     {
         if (_disposed)
             return;  // Already shutdown
@@ -632,8 +666,9 @@ public class SerfAgent : IAsyncDisposable
                 _rpcServer = null;
             }
 
-            // Gracefully leave the cluster before shutdown (broadcasts leave event)
-            if (Serf != null)
+            // Gracefully leave the cluster before shutdown (broadcasts leave event), unless a leave
+            // already happened (e.g. the agent runner's graceful signal handling left first).
+            if (leave && Serf != null && Serf.State() == SerfState.SerfAlive)
             {
                 try
                 {
@@ -657,6 +692,10 @@ public class SerfAgent : IAsyncDisposable
                     _logger?.LogWarning(ex, "[Agent] Error during leave, forcing shutdown");
                 }
 
+            }
+
+            if (Serf != null)
+            {
                 // Shutdown Serf (triggers an event channel close)
                 await Serf.ShutdownAsync();
                 Serf = null;

@@ -1,6 +1,7 @@
 // Copyright (c) BoolHak, Inc.
 // SPDX-License-Identifier: MPL-2.0
 
+using System.Runtime.InteropServices;
 
 namespace NSerf.Agent;
 
@@ -15,22 +16,51 @@ public delegate void SignalCallback(Signal signal);
 
 /// <summary>
 /// Cross-platform signal handling.
-/// Windows: Console.CancelKeyPress for SIGINT, custom events for others
-/// Unix: POSIX signals
+/// Maps to: Go's signal.Notify(ch, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP) in command.go.
+/// Unix: <see cref="PosixSignalRegistration"/> for SIGINT, SIGTERM and SIGHUP. The registrations cancel
+/// the runtime's default handling so the process is not terminated before the callbacks run (which is
+/// what makes a graceful leave on SIGTERM possible).
+/// Windows: Console.CancelKeyPress for SIGINT and AppDomain.ProcessExit as the SIGTERM fallback.
 /// </summary>
 public sealed class SignalHandler : IDisposable
 {
     private readonly List<SignalCallback> _callbacks = [];
     private readonly object _lock = new();
+    private readonly List<PosixSignalRegistration> _registrations = [];
     private bool _disposed;
 
     public SignalHandler()
     {
-        // Register for Ctrl+C (SIGINT on Unix, Ctrl+C on Windows)
-        Console.CancelKeyPress += OnCancelKeyPress;
+        if (OperatingSystem.IsWindows())
+        {
+            // Register for Ctrl+C / Ctrl+Break
+            Console.CancelKeyPress += OnCancelKeyPress;
 
-        // Register for process exit (SIGTERM equivalent)
-        AppDomain.CurrentDomain.ProcessExit += OnProcessExit;
+            // Register for process exit (closest SIGTERM equivalent on Windows)
+            AppDomain.CurrentDomain.ProcessExit += OnProcessExit;
+            return;
+        }
+
+        RegisterPosix(PosixSignal.SIGINT, Signal.SIGINT);
+        RegisterPosix(PosixSignal.SIGTERM, Signal.SIGTERM);
+        RegisterPosix(PosixSignal.SIGHUP, Signal.SIGHUP);
+    }
+
+    private void RegisterPosix(PosixSignal posixSignal, Signal signal)
+    {
+        try
+        {
+            _registrations.Add(PosixSignalRegistration.Create(posixSignal, context =>
+            {
+                // Keep the process alive: the callbacks decide when (and how) to exit.
+                context.Cancel = true;
+                TriggerSignal(signal);
+            }));
+        }
+        catch (PlatformNotSupportedException)
+        {
+            // Signal not supported on this platform; nothing to register.
+        }
     }
 
     public void RegisterCallback(SignalCallback callback)
@@ -83,20 +113,29 @@ public sealed class SignalHandler : IDisposable
         {
             if (_disposed) return;
         }
-        
+
         if (disposing)
         {
             // Free managed resources
-            Console.CancelKeyPress -= OnCancelKeyPress;
-            AppDomain.CurrentDomain.ProcessExit -= OnProcessExit;
+            if (OperatingSystem.IsWindows())
+            {
+                Console.CancelKeyPress -= OnCancelKeyPress;
+                AppDomain.CurrentDomain.ProcessExit -= OnProcessExit;
+            }
+
+            foreach (var registration in _registrations)
+            {
+                registration.Dispose();
+            }
+            _registrations.Clear();
         }
-        
+
         lock (_lock)
         {
             _disposed = true;
         }
     }
-    
+
     public void Dispose()
     {
         Dispose(true);

@@ -5,7 +5,7 @@ namespace NSerf.Serf.Events;
 
 /// <summary>
 /// Base interface for all Serf events.
-/// Minimal implementation for Phase 0 - will be expanded in Phase 3.
+/// Maps to: Go's Event interface in event.go
 /// </summary>
 public interface IEvent
 {

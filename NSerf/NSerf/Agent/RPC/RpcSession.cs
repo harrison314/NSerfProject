@@ -6,6 +6,7 @@ using System.Runtime.InteropServices;
 using MessagePack;
 using NSerf.Client;
 using NSerf.Serf;
+using NSerf.Serf.Events;
 
 namespace NSerf.Agent.RPC;
 
@@ -20,6 +21,20 @@ public class RpcSession : IAsyncDisposable
     private bool _disposed;
     private int _clientVersion;  // 0 = no handshake yet
     private readonly SemaphoreSlim _writeLock = new(1, 1);  // CRITICAL: Prevent overlapping writes
+
+    // Streams opened on this connection keyed by the seq of the command that opened them
+    // (Go: IPCClient.eventStreams / logStreamer / queryStreams). Disposing an entry stops it.
+    private readonly Dictionary<ulong, IDisposable> _streams = [];
+    private readonly object _streamsLock = new();
+
+    // Queries streamed to this client that it may still answer with 'respond'
+    // (Go: IPCClient.pendingQueries, keyed by a per-session counter).
+    private readonly Dictionary<ulong, Query> _pendingQueries = [];
+    private readonly object _pendingQueriesLock = new();
+    private ulong _nextQueryId;
+
+    // Cancelled when the session ends so timers and stream writers stop
+    private readonly CancellationTokenSource _sessionCts = new();
 
     private static readonly MessagePackSerializerOptions MsgPackOptions =
         MessagePackSerializerOptions.Standard
@@ -36,6 +51,9 @@ public class RpcSession : IAsyncDisposable
 
     public async Task HandleAsync(CancellationToken cancellationToken)
     {
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _sessionCts.Token);
+        cancellationToken = linkedCts.Token;
+
         try
         {
             while (!cancellationToken.IsCancellationRequested && !_disposed && _reader != null)
@@ -85,6 +103,12 @@ public class RpcSession : IAsyncDisposable
         catch (Exception)
         {
             // Session error
+        }
+        finally
+        {
+            // The connection is gone: stop every stream and forget pending queries (Go: deregisters on close)
+            CancelSession();
+            StopAllStreams();
         }
     }
 
@@ -163,6 +187,30 @@ public class RpcSession : IAsyncDisposable
 
                 case RpcCommands.Stream:
                     await HandleStreamAsync(header, cancellationToken);
+                    break;
+
+                case RpcCommands.Stop:
+                    await HandleStopAsync(header, cancellationToken);
+                    break;
+
+                case RpcCommands.Respond:
+                    await HandleRespondAsync(header, cancellationToken);
+                    break;
+
+                case RpcCommands.InstallKey:
+                    await HandleKeyCommandAsync(header, cancellationToken, readKey: true, (km, key) => km.InstallKey(key));
+                    break;
+
+                case RpcCommands.UseKey:
+                    await HandleKeyCommandAsync(header, cancellationToken, readKey: true, (km, key) => km.UseKey(key));
+                    break;
+
+                case RpcCommands.RemoveKey:
+                    await HandleKeyCommandAsync(header, cancellationToken, readKey: true, (km, key) => km.RemoveKey(key));
+                    break;
+
+                case RpcCommands.ListKeys:
+                    await HandleKeyCommandAsync(header, cancellationToken, readKey: false, (km, _) => km.ListKeys());
                     break;
 
                 default:
@@ -561,24 +609,10 @@ public class RpcSession : IAsyncDisposable
 
         var request = MessagePackSerializer.Deserialize<Client.Requests.QueryRequest>(requestBytes.Value, MsgPackOptions, cancellationToken);
 
-        // Parse filter tags
-        Dictionary<string, string>? filterTags = null;
-        if (!string.IsNullOrEmpty(request.FilterTags))
-        {
-            try
-            {
-                filterTags = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, string>>(request.FilterTags);
-            }
-            catch
-            {
-                // If parsing fails, leave as null
-            }
-        }
-
         var queryParam = new QueryParam
         {
-            FilterNodes = string.IsNullOrEmpty(request.FilterNodes) ? null : [request.FilterNodes],
-            FilterTags = filterTags,
+            FilterNodes = request.FilterNodes.Length > 0 ? request.FilterNodes : null,
+            FilterTags = request.FilterTags.Count > 0 ? request.FilterTags : null,
             RequestAck = request.RequestAck,
             Timeout = TimeSpan.FromSeconds(request.Timeout)
         };
@@ -595,27 +629,28 @@ public class RpcSession : IAsyncDisposable
             errorMsg = ex.Message;
         }
 
+        // An error response is header-only, like every other command (Go: no body on error)
+        if (queryResp == null)
+        {
+            await SendErrorAsync(header.Seq, errorMsg ?? "Query failed", cancellationToken);
+            return;
+        }
+
+        // Register the response stream before acknowledging so a stop cannot race the registration
+        var streamer = new QueryResponseStream(_writeLock, _stream!, header.Seq, queryResp);
+        RegisterStream(header.Seq, streamer);
+
         // Send initial response with query ID
         await _writeLock.WaitAsync(cancellationToken);
         try
         {
-            var response = new ResponseHeader { Seq = header.Seq, Error = errorMsg ?? string.Empty };
+            var response = new ResponseHeader { Seq = header.Seq, Error = string.Empty };
             var responseBytes = MessagePackSerializer.Serialize(response, MsgPackOptions, cancellationToken);
             await _stream!.WriteAsync(responseBytes, cancellationToken);
 
-            // Send query ID in the response body (Go returns nil on error)
-            if (queryResp != null)
-            {
-                var queryResponse = new Client.Responses.QueryResponse { Id = queryResp.Id };
-                var bodyBytes = MessagePackSerializer.Serialize(queryResponse, MsgPackOptions, cancellationToken);
-                await _stream.WriteAsync(bodyBytes, cancellationToken);
-            }
-            else
-            {
-                // Send empty body on error
-                var emptyBody = MessagePackSerializer.Serialize(new { }, MsgPackOptions, cancellationToken);
-                await _stream.WriteAsync(emptyBody, cancellationToken);
-            }
+            var queryResponse = new Client.Responses.QueryResponse { Id = queryResp.Id };
+            var bodyBytes = MessagePackSerializer.Serialize(queryResponse, MsgPackOptions, cancellationToken);
+            await _stream.WriteAsync(bodyBytes, cancellationToken);
             await _stream.FlushAsync(cancellationToken);
         }
         finally
@@ -623,12 +658,18 @@ public class RpcSession : IAsyncDisposable
             _writeLock.Release();
         }
 
-        // Stream the query responses asynchronously (Go: defer go qs.Stream)
-        if (queryResp != null)
+        // Stream the query records (ack / response / done) asynchronously (Go: defer qs.Stream)
+        _ = Task.Run(async () =>
         {
-            var streamer = new QueryResponseStream(_writeLock, _stream!, header.Seq, queryResp);
-            _ = Task.Run(() => streamer.StreamAsync(cancellationToken), cancellationToken);
-        }
+            try
+            {
+                await streamer.StreamAsync(cancellationToken);
+            }
+            finally
+            {
+                UnregisterStream(header.Seq, streamer);
+            }
+        }, CancellationToken.None);
     }
 
     private async Task HandleStatsAsync(RequestHeader header, CancellationToken cancellationToken)
@@ -757,41 +798,16 @@ public class RpcSession : IAsyncDisposable
 
         var request = MessagePackSerializer.Deserialize<Client.Requests.MonitorRequest>(requestBytes.Value, MsgPackOptions, cancellationToken);
 
-        // Send success response
-        await _writeLock.WaitAsync(cancellationToken);
-        try
-        {
-            var response = new ResponseHeader { Seq = header.Seq, Error = string.Empty };
-            var responseBytes = MessagePackSerializer.Serialize(response, MsgPackOptions, cancellationToken);
-            await _stream!.WriteAsync(responseBytes, cancellationToken);
-            await _stream.FlushAsync(cancellationToken);
-        }
-        finally
-        {
-            _writeLock.Release();
-        }
-
-        // Register log handler and stream logs
-        // Apply log-level filtering as requested by the client
+        // Apply log-level filtering as requested by the client; records carry the seq of this command
         var requestedLevel = LogLevelExtensions.FromString(request.LogLevel ?? "INFO");
-        var baseHandler = new RpcLogHandler(_stream!, _writeLock, cancellationToken);
+        var baseHandler = new RpcLogHandler(_stream!, _writeLock, header.Seq, cancellationToken);
         var filteredHandler = new FilteredLogHandler(baseHandler, requestedLevel);
-        _agent.LogWriter?.RegisterHandler(filteredHandler);
+        RegisterStream(header.Seq, new LogStreamRegistration(_agent.LogWriter, filteredHandler, baseHandler));
 
-        try
-        {
-            // Keep streaming until the client disconnects or cancellation
-            await Task.Delay(-1, cancellationToken);
-        }
-        catch (OperationCanceledException)
-        {
-            // Normal cancellation
-        }
-        finally
-        {
-            _agent.LogWriter?.DeregisterHandler(filteredHandler);
-            baseHandler.Dispose();
-        }
+        // Acknowledge first, then register so the backlog and live lines follow the ack
+        // (Go: defer i.logWriter.RegisterHandler(client.logStreamer)); the read loop continues immediately.
+        await SendHeaderAsync(header.Seq, string.Empty, cancellationToken);
+        _agent.LogWriter?.RegisterHandler(filteredHandler);
     }
 
     private async Task HandleStreamAsync(RequestHeader header, CancellationToken cancellationToken)
@@ -812,41 +828,291 @@ public class RpcSession : IAsyncDisposable
 
         var request = MessagePackSerializer.Deserialize<Client.Requests.StreamRequest>(requestBytes.Value, MsgPackOptions, cancellationToken);
 
-        // Send success response
+        // Validate the filter before acknowledging (Go: "Unknown event filter")
+        RpcEventHandler eventHandler;
+        try
+        {
+            eventHandler = new RpcEventHandler(_stream!, _writeLock, header.Seq, request.Type, RegisterQuery, cancellationToken);
+        }
+        catch (ArgumentException ex)
+        {
+            await SendErrorAsync(header.Seq, $"Invalid event filter '{request.Type}': {ex.Message}", cancellationToken);
+            return;
+        }
+
+        RegisterStream(header.Seq, new EventStreamRegistration(_agent, eventHandler));
+
+        // Acknowledge first, then register so events follow the ack
+        // (Go: defer i.agent.RegisterEventHandler(...)); the read loop continues immediately.
+        await SendHeaderAsync(header.Seq, string.Empty, cancellationToken);
+        _agent.RegisterEventHandler(eventHandler);
+    }
+
+    /// <summary>
+    /// Stops the stream (monitor, stream or query) opened by the command with seq = request.Stop.
+    /// Maps to: Go's handleStop in ipc.go (NSerf reports an unknown seq as an error).
+    /// </summary>
+    private async Task HandleStopAsync(RequestHeader header, CancellationToken cancellationToken)
+    {
+        if (!CheckAuth())
+        {
+            await SendErrorAsync(header.Seq, "Not authenticated", cancellationToken);
+            return;
+        }
+
+        var requestBytes = await _reader!.ReadAsync(cancellationToken);
+        if (!requestBytes.HasValue) return;
+
+        var request = MessagePackSerializer.Deserialize<Client.Requests.StopRequest>(requestBytes.Value, MsgPackOptions, cancellationToken);
+
+        IDisposable? stream;
+        lock (_streamsLock)
+        {
+            _streams.Remove(request.Stop, out stream);
+        }
+
+        if (stream == null)
+        {
+            await SendErrorAsync(header.Seq, "Unknown stream", cancellationToken);
+            return;
+        }
+
+        // Deregister and stop before acknowledging: no record for that seq follows the ack
+        stream.Dispose();
+        await SendHeaderAsync(header.Seq, string.Empty, cancellationToken);
+    }
+
+    /// <summary>
+    /// Answers a query that was streamed to this client, identified by the session-scoped query ID.
+    /// Maps to: Go's handleRespond in ipc.go
+    /// </summary>
+    private async Task HandleRespondAsync(RequestHeader header, CancellationToken cancellationToken)
+    {
+        if (!CheckAuth())
+        {
+            await SendErrorAsync(header.Seq, "Not authenticated", cancellationToken);
+            return;
+        }
+
+        var requestBytes = await _reader!.ReadAsync(cancellationToken);
+        if (!requestBytes.HasValue) return;
+
+        var request = MessagePackSerializer.Deserialize<Client.Requests.RespondRequest>(requestBytes.Value, MsgPackOptions, cancellationToken);
+
+        Query? query;
+        lock (_pendingQueriesLock)
+        {
+            _pendingQueries.TryGetValue(request.ID, out query);
+        }
+
+        var error = string.Empty;
+        if (query == null)
+        {
+            error = "Unknown query";
+        }
+        else
+        {
+            try
+            {
+                await query.RespondAsync(request.Payload);
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+            }
+        }
+
+        await SendHeaderAsync(header.Seq, error, cancellationToken);
+    }
+
+    /// <summary>
+    /// Registers a streamed query as pending so the client can answer it with 'respond', and forgets it
+    /// once its deadline passes. Maps to: Go's IPCClient.RegisterQuery in ipc.go
+    /// </summary>
+    private ulong RegisterQuery(Query query)
+    {
+        ulong id;
+        lock (_pendingQueriesLock)
+        {
+            id = _nextQueryId++;
+            _pendingQueries[id] = query;
+        }
+
+        var timeout = query.GetDeadline() - DateTime.UtcNow;
+        if (timeout < TimeSpan.Zero)
+        {
+            timeout = TimeSpan.Zero;
+        }
+
+        // Task.Delay rejects delays beyond ~49 days; a query with an absurd timeout is simply kept that long
+        var maxDelay = TimeSpan.FromMilliseconds(uint.MaxValue - 1);
+        if (timeout > maxDelay)
+        {
+            timeout = maxDelay;
+        }
+
+        _ = Task.Delay(timeout, _sessionCts.Token).ContinueWith(_ =>
+        {
+            lock (_pendingQueriesLock)
+            {
+                _pendingQueries.Remove(id);
+            }
+        }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+
+        return id;
+    }
+
+    private void RegisterStream(ulong seq, IDisposable stream)
+    {
+        IDisposable? previous;
+        lock (_streamsLock)
+        {
+            _streams.Remove(seq, out previous);
+            _streams[seq] = stream;
+        }
+
+        // A client that reuses a seq replaces the stream it opened with it
+        previous?.Dispose();
+    }
+
+    private void UnregisterStream(ulong seq, IDisposable stream)
+    {
+        lock (_streamsLock)
+        {
+            if (_streams.TryGetValue(seq, out var current) && ReferenceEquals(current, stream))
+            {
+                _streams.Remove(seq);
+            }
+        }
+    }
+
+    private void StopAllStreams()
+    {
+        IDisposable[] streams;
+        lock (_streamsLock)
+        {
+            streams = [.. _streams.Values];
+            _streams.Clear();
+        }
+
+        foreach (var stream in streams)
+        {
+            try
+            {
+                stream.Dispose();
+            }
+            catch
+            {
+                // Best effort teardown
+            }
+        }
+
+        lock (_pendingQueriesLock)
+        {
+            _pendingQueries.Clear();
+        }
+    }
+
+    private void CancelSession()
+    {
+        try
+        {
+            _sessionCts.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            // Already torn down
+        }
+    }
+
+    /// <summary>
+    /// An open 'stream' command: disposing deregisters the handler from the agent and stops its writes.
+    /// </summary>
+    private sealed class EventStreamRegistration(SerfAgent agent, RpcEventHandler handler) : IDisposable
+    {
+        public void Dispose()
+        {
+            agent.DeregisterEventHandler(handler);
+            handler.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// An open 'monitor' command: disposing deregisters the handler from the log writer and stops its writes.
+    /// </summary>
+    private sealed class LogStreamRegistration(CircularLogWriter? logWriter, CircularLogWriter.ILogHandler filtered, RpcLogHandler handler) : IDisposable
+    {
+        public void Dispose()
+        {
+            logWriter?.DeregisterHandler(filtered);
+            handler.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Handles install-key / use-key / remove-key / list-keys by delegating to <see cref="KeyManager"/>.
+    /// Per-node failures are reported through the response body (NumErr / Messages), not the header.
+    /// Maps to: Go's handleInstallKey/handleUseKey/handleRemoveKey/handleListKeys in ipc.go
+    /// </summary>
+    private async Task HandleKeyCommandAsync(
+        RequestHeader header,
+        CancellationToken cancellationToken,
+        bool readKey,
+        Func<KeyManager, string, Task<KeyResponse>> operation)
+    {
+        if (!CheckAuth())
+        {
+            await SendErrorAsync(header.Seq, "Not authenticated", cancellationToken);
+            return;
+        }
+
+        var key = string.Empty;
+        if (readKey)
+        {
+            var requestBytes = await _reader!.ReadAsync(cancellationToken);
+            if (!requestBytes.HasValue) return;
+
+            var request = MessagePackSerializer.Deserialize<Client.Requests.KeyRequest>(requestBytes.Value, MsgPackOptions, cancellationToken);
+            key = request.Key;
+        }
+
+        var serf = _agent.Serf ?? throw new InvalidOperationException("Agent not started");
+        var result = await operation(new KeyManager(serf), key);
+
+        var response = new Client.Responses.KeyResponse
+        {
+            NumNodes = result.NumNodes,
+            NumErr = result.NumErr,
+            NumResp = result.NumResp,
+            Keys = result.Keys,
+            Messages = result.Messages,
+            PrimaryKeys = result.PrimaryKeys
+        };
+
         await _writeLock.WaitAsync(cancellationToken);
         try
         {
-            var response = new ResponseHeader { Seq = header.Seq, Error = string.Empty };
-            var responseBytes = MessagePackSerializer.Serialize(response, MsgPackOptions, cancellationToken);
-            await _stream!.WriteAsync(responseBytes, cancellationToken);
+            var headerResponse = new ResponseHeader { Seq = header.Seq, Error = string.Empty };
+            var headerBytes = MessagePackSerializer.Serialize(headerResponse, MsgPackOptions, cancellationToken);
+            await _stream!.WriteAsync(headerBytes, cancellationToken);
+
+            var bodyBytes = MessagePackSerializer.Serialize(response, MsgPackOptions, cancellationToken);
+            await _stream.WriteAsync(bodyBytes, cancellationToken);
             await _stream.FlushAsync(cancellationToken);
         }
         finally
         {
             _writeLock.Release();
         }
-
-        // Register event handler and stream events
-        var eventHandler = new RpcEventHandler(_stream!, _writeLock, request.Type, cancellationToken);
-        _agent.RegisterEventHandler(eventHandler);
-
-        try
-        {
-            // Keep streaming until the client disconnects or cancellation
-            await Task.Delay(-1, cancellationToken);
-        }
-        catch (OperationCanceledException)
-        {
-            // Normal cancellation
-        }
-        finally
-        {
-            _agent.DeregisterEventHandler(eventHandler);
-            eventHandler.Dispose();
-        }
     }
 
-    private async Task SendErrorAsync(ulong seq, string error, CancellationToken cancellationToken)
+    private Task SendErrorAsync(ulong seq, string error, CancellationToken cancellationToken)
+        => SendHeaderAsync(seq, error, cancellationToken);
+
+    /// <summary>
+    /// Writes a header-only response (an acknowledgement when <paramref name="error"/> is empty).
+    /// </summary>
+    private async Task SendHeaderAsync(ulong seq, string error, CancellationToken cancellationToken)
     {
         await _writeLock.WaitAsync(cancellationToken);
         try
@@ -881,10 +1147,15 @@ public class RpcSession : IAsyncDisposable
         if (_disposed) return ValueTask.CompletedTask;
         _disposed = true;
 
+        // Stop stream writers and pending-query timers before tearing down the connection
+        CancelSession();
+        StopAllStreams();
+
         _reader?.Dispose();
         _stream?.Dispose();
         _client.Dispose();
         _writeLock.Dispose();
+        _sessionCts.Dispose();
 
         GC.SuppressFinalize(this);
         return ValueTask.CompletedTask;

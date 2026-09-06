@@ -23,9 +23,8 @@ internal class PacketHandler(Memberlist memberlist, ILogger? logger)
     {
         if (!memberlist.Config.StealthUdp)
         {
-            logger?.LogInformation("[PACKET] Received {Size} bytes from {From}, first byte: {FirstByte}", buf.Length, from, buf[0]);
+            logger?.LogDebug("[PACKET] Received {Size} bytes from {From}, first byte: {FirstByte}", buf.Length, from, buf[0]);
         }
-        logger?.LogDebug("[PACKET] Received {Size} bytes from {From}", buf.Length, from);
 
         // Remove label header if present
         string packetLabel;
@@ -335,6 +334,10 @@ internal class PacketHandler(Memberlist memberlist, ILogger? logger)
                 localSeqNo,
                 (payload, timestamp) =>
                 {
+                    // The temporary handler is single-use: drop it as soon as the ack arrives
+                    // (Go: invokeAckHandler deletes the entry) so relayed probes do not leak.
+                    memberlist.AckHandlers.TryRemove(localSeqNo, out _);
+
                     // Forward ack back to requester
                     var ack = new Messages.AckRespMessage
                     {
@@ -346,13 +349,17 @@ internal class PacketHandler(Memberlist memberlist, ILogger? logger)
                 },
                 () =>
                 {
+                    // No ack within ProbeTimeout: the handler has expired, remove its entry
+                    // (Go: setAckHandler's timer deletes the entry) before sending any nack.
+                    memberlist.AckHandlers.TryRemove(localSeqNo, out _);
+
                     // Send nack if requested
                     if (!ind.Nack) return;
                     var nackAddr = new Transport.Address { Addr = indAddr, Name = indName };
                     var nack = new NackRespMessage { SeqNo = ind.SeqNo };
                     _ = EncodeAndSendMessageAsync(nackAddr, MessageType.NackResp, nack);
                 },
-                TimeSpan.FromSeconds(5)
+                memberlist.Config.ProbeTimeout
             );
 
             // Register handler temporarily
@@ -428,15 +435,8 @@ internal class PacketHandler(Memberlist memberlist, ILogger? logger)
     {
         try
         {
-            if (buf.Length < 4)
-            {
-                if (!memberlist.Config.StealthUdp)
-                {
-                    logger?.LogError("Nack message too short from {From}", from);
-                }
-                return;
-            }
-            var seqNo = (uint)(buf[0] << 24 | buf[1] << 16 | buf[2] << 8 | buf[3]);
+            // Decode the NackRespMessage using MessagePack like Go implementation
+            var seqNo = Messages.MessageEncoder.Decode<NackRespMessage>(buf).SeqNo;
             if (!memberlist.Config.StealthUdp)
             {
                 logger?.LogDebug("Received nack seq={Seq} from {From}", seqNo, from);
@@ -461,7 +461,7 @@ internal class PacketHandler(Memberlist memberlist, ILogger? logger)
     {
         if (!memberlist.Config.StealthUdp)
         {
-            logger?.LogInformation("[QUEUE] Processing {MessageType} message from {From}", msgType, from);
+            logger?.LogDebug("[QUEUE] Processing {MessageType} message from {From}", msgType, from);
         }
 
         // Process messages synchronously for now
@@ -499,12 +499,12 @@ internal class PacketHandler(Memberlist memberlist, ILogger? logger)
                 case MessageType.Dead:
                     if (!memberlist.Config.StealthUdp)
                     {
-                        logger?.LogInformation("[QUEUE] Decoding Dead message, buf length: {Length}", buf.Length);
+                        logger?.LogDebug("[QUEUE] Decoding Dead message, buf length: {Length}", buf.Length);
                     }
                     var deadMsg = Messages.MessageEncoder.Decode<Messages.DeadMessage>(buf);
                     if (!memberlist.Config.StealthUdp)
                     {
-                        logger?.LogInformation("[QUEUE] Decoded Dead: Node={Node}, From={From}, Inc={Inc}",
+                        logger?.LogDebug("[QUEUE] Decoded Dead: Node={Node}, From={From}, Inc={Inc}",
                             deadMsg.Node, deadMsg.From, deadMsg.Incarnation);
                     }
                     var dead = new Messages.Dead
@@ -516,7 +516,7 @@ internal class PacketHandler(Memberlist memberlist, ILogger? logger)
                     stateHandler.HandleDeadNode(dead);
                     if (!memberlist.Config.StealthUdp)
                     {
-                        logger?.LogInformation("[QUEUE] HandleDeadNode returned for {Node}", deadMsg.Node);
+                        logger?.LogDebug("[QUEUE] HandleDeadNode returned for {Node}", deadMsg.Node);
                     }
                     break;
 

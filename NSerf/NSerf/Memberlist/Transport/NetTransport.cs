@@ -82,7 +82,42 @@ public class NetTransport : INodeAwareTransport
             _logger?.LogDebug("[NetTransport] Windows: Selected port {Port} from safe range", port);
         }
 
-        // Build all TCP and UDP listeners
+        // When the OS picks the port (BindPort == 0) the TCP listener may land on a port whose UDP
+        // counterpart is already in use, so the UDP bind fails with "Address already in use".
+        // Start over with a fresh OS-assigned port in that case.
+        const int maxAttempts = 10;
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                BindListeners(port);
+                break;
+            }
+            catch (SocketException ex) when (_config.BindPort == 0 && attempt < maxAttempts)
+            {
+                _logger?.LogDebug(ex, "[NetTransport] Bind attempt {Attempt} failed, retrying with a new port", attempt);
+                CloseListeners();
+                port = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? GetAvailablePortOnWindows() : 0;
+            }
+        }
+
+        // Start background listeners
+        for (var i = 0; i < _config.BindAddrs.Count; i++)
+        {
+            var tcpListener = _tcpListeners[i];
+            var udpListener = _udpListeners[i];
+
+            _backgroundTasks.Add(Task.Run(() => TcpListenAsync(tcpListener)));
+            _backgroundTasks.Add(Task.Run(() => UdpListenAsync(udpListener)));
+        }
+    }
+
+    /// <summary>
+    /// Builds the TCP and UDP listeners for every bind address on the given port
+    /// (0 lets the OS choose the port via the first TCP listener).
+    /// </summary>
+    private void BindListeners(int port)
+    {
         foreach (var addr in _config.BindAddrs)
         {
             var ip = IPAddress.Parse(addr);
@@ -90,11 +125,11 @@ public class NetTransport : INodeAwareTransport
             // Create TCP listener with SO_REUSEADDR to avoid TIME_WAIT issues
             var tcpListener = new TcpListener(ip, port);
             // On Windows, disable ExclusiveAddressUse to allow port reuse
-            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) 
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
                 tcpListener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ExclusiveAddressUse, false);
             tcpListener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-            tcpListener.Start();
             _tcpListeners.Add(tcpListener);
+            tcpListener.Start();
 
             // If port was still 0 (non-Windows), use the OS-assigned port for all listeners
             if (port == 0)
@@ -111,6 +146,7 @@ public class NetTransport : INodeAwareTransport
                 udpListener.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ExclusiveAddressUse, false);
             }
             udpListener.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+            _udpListeners.Add(udpListener);
             udpListener.Client.Bind(new IPEndPoint(ip, port));
 
             // Try to set large receive buffer
@@ -130,19 +166,26 @@ public class NetTransport : INodeAwareTransport
                     // Use default if we can't set it
                 }
             }
-
-            _udpListeners.Add(udpListener);
         }
+    }
 
-        // Start background listeners
-        for (var i = 0; i < _config.BindAddrs.Count; i++)
+    /// <summary>
+    /// Closes any listeners created by a failed bind attempt.
+    /// </summary>
+    private void CloseListeners()
+    {
+        foreach (var listener in _tcpListeners)
         {
-            var tcpListener = _tcpListeners[i];
-            var udpListener = _udpListeners[i];
-
-            _backgroundTasks.Add(Task.Run(() => TcpListenAsync(tcpListener)));
-            _backgroundTasks.Add(Task.Run(() => UdpListenAsync(udpListener)));
+            try { listener.Stop(); } catch { /* best effort */ }
         }
+
+        foreach (var listener in _udpListeners)
+        {
+            try { listener.Close(); } catch { /* best effort */ }
+        }
+
+        _tcpListeners.Clear();
+        _udpListeners.Clear();
     }
 
     /// <summary>

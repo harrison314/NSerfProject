@@ -15,9 +15,21 @@ public class AckNackHandler(ILogger? logger = null)
     private readonly ConcurrentDictionary<uint, AckHandler> _handlers = new();
 
     /// <summary>
-    /// Sets an ack handler for a sequence number.
+    /// Sets an ack handler for a sequence number. When the timeout elapses without an ack,
+    /// the handler is removed and <paramref name="nackFn"/> is invoked.
     /// </summary>
     public void SetAckHandler(uint seqNo, Action<byte[], DateTimeOffset> ackFn, Action? nackFn, TimeSpan timeout)
+    {
+        SetAckHandler(seqNo, ackFn, nackFn, nackFn, timeout);
+    }
+
+    /// <summary>
+    /// Sets an ack handler for a sequence number with distinct nack and timeout callbacks
+    /// (Go's setProbeChannels): <paramref name="nackFn"/> runs for every nack received while the
+    /// handler is registered, <paramref name="timeoutFn"/> runs once when the timeout elapses
+    /// without an ack, after the handler has been removed.
+    /// </summary>
+    public void SetAckHandler(uint seqNo, Action<byte[], DateTimeOffset> ackFn, Action? nackFn, Action? timeoutFn, TimeSpan timeout)
     {
         var handler = new AckHandler
         {
@@ -26,8 +38,8 @@ public class AckNackHandler(ILogger? logger = null)
             Timer = new Timer(_ =>
             {
                 if (!_handlers.TryRemove(seqNo, out var h)) return;
-                h.NackFn?.Invoke();
                 h.Dispose();
+                timeoutFn?.Invoke();
             }, null, timeout, Timeout.InfiniteTimeSpan)
         };
 
@@ -46,14 +58,13 @@ public class AckNackHandler(ILogger? logger = null)
     }
 
     /// <summary>
-    /// Invokes nack handler for a sequence number.
+    /// Invokes the nack handler for a sequence number. Like Go's invokeNackHandler this leaves the
+    /// handler registered: several intermediaries may nack while an ack (or the timeout) is still pending.
     /// </summary>
     public void InvokeNack(uint seqNo)
     {
-        if (!_handlers.TryRemove(seqNo, out var handler)) return;
-        handler.Timer?.Dispose();
+        if (!_handlers.TryGetValue(seqNo, out var handler)) return;
         handler.NackFn?.Invoke();
-        handler.Dispose();
     }
 
     /// <summary>

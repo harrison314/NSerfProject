@@ -8,11 +8,17 @@ namespace NSerf.Client.Requests;
 [MessagePackObject]
 public class QueryRequest
 {
+    /// <summary>
+    /// Restrict the query to these node names (empty = all nodes).
+    /// </summary>
     [Key(0)]
-    public string FilterNodes { get; set; } = string.Empty;
-    
+    public string[] FilterNodes { get; set; } = [];
+
+    /// <summary>
+    /// Tag name -> regular expression that a node's tag value must match (empty = no tag filter).
+    /// </summary>
     [Key(1)]
-    public string FilterTags { get; set; } = string.Empty;
+    public Dictionary<string, string> FilterTags { get; set; } = new();
     
     [Key(2)]
     public bool RequestAck { get; set; }

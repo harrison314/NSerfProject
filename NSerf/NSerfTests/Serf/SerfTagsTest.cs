@@ -68,7 +68,7 @@ public class SerfTagsTest
         numJoined.Should().BeGreaterThan(0, "join should succeed");
 
         // Wait for cluster convergence
-        await Task.Delay(500);
+        await TestHelpers.WaitUntilNumNodesAsync(2, TimeSpan.FromSeconds(10), s1, s2);
 
         // Both nodes should see 2 members
         s1.NumMembers().Should().Be(2);
@@ -78,34 +78,25 @@ public class SerfTagsTest
         await s1.SetTagsAsync(new Dictionary<string, string> { { "port", "8000" } });
         await s2.SetTagsAsync(new Dictionary<string, string> { { "datacenter", "east-aws" } });
 
-        // Wait for tag propagation with retry logic (like Go test)
-        Member? s1Node1 = null;
-        Member? s1Node2 = null;
-        Member? s2Node1 = null;
-        Member? s2Node2 = null;
+        // Wait for tag propagation with retry logic (like Go's TestSerf_SetTags: every node must see
+        // the other node's new tags, not just its own)
+        static string? TagOf(NSerf.Serf.Serf serf, string nodeName, string tag) =>
+            serf.Members().FirstOrDefault(m => m.Name == nodeName)?.Tags.GetValueOrDefault(tag);
 
-        // Retry for up to 5 seconds
-        for (int i = 0; i < 50; i++)
-        {
-            await Task.Delay(100);
+        await TestHelpers.WaitForConditionAsync(
+            () => TagOf(s1, "node1", "port") == "8000" &&
+                  TagOf(s1, "node2", "datacenter") == "east-aws" &&
+                  TagOf(s2, "node1", "port") == "8000" &&
+                  TagOf(s2, "node2", "datacenter") == "east-aws",
+            TimeSpan.FromSeconds(10),
+            () => "tags did not propagate: " +
+            $"s1 sees node1.port='{TagOf(s1, "node1", "port")}', node2.datacenter='{TagOf(s1, "node2", "datacenter")}'; " +
+            $"s2 sees node1.port='{TagOf(s2, "node1", "port")}', node2.datacenter='{TagOf(s2, "node2", "datacenter")}'");
 
-            var s1Members = s1.Members();
-            s1Node1 = s1Members.FirstOrDefault(m => m.Name == "node1");
-            s1Node2 = s1Members.FirstOrDefault(m => m.Name == "node2");
-
-            var s2Members = s2.Members();
-            s2Node1 = s2Members.FirstOrDefault(m => m.Name == "node1");
-            s2Node2 = s2Members.FirstOrDefault(m => m.Name == "node2");
-
-            // Check if all tags have propagated
-            if (s1Node1?.Tags.ContainsKey("port") == true &&
-                s1Node2?.Tags.ContainsKey("datacenter") == true &&
-                s2Node1?.Tags.ContainsKey("port") == true &&
-                s2Node2?.Tags.ContainsKey("datacenter") == true)
-            {
-                break; // All tags propagated
-            }
-        }
+        var s1Node1 = s1.Members().FirstOrDefault(m => m.Name == "node1");
+        var s1Node2 = s1.Members().FirstOrDefault(m => m.Name == "node2");
+        var s2Node1 = s2.Members().FirstOrDefault(m => m.Name == "node1");
+        var s2Node2 = s2.Members().FirstOrDefault(m => m.Name == "node2");
 
         // Assert - Verify each node sees its own tags (local update works)
         s1Node1.Should().NotBeNull();
@@ -116,13 +107,12 @@ public class SerfTagsTest
         s2Node2!.Tags.Should().ContainKey("datacenter");
         s2Node2.Tags["datacenter"].Should().Be("east-aws", "node2 should see its own updated tags");
 
-        // Note: Cross-node tag propagation (s1 seeing s2's tags and vice versa) requires
-        // the gossip background task to be actively running and processing the broadcast queue.
-        // This is a known limitation of the current test setup and would require more complex
-        // integration test infrastructure to verify properly.
+        // Assert - Cross-node tag propagation (s1 sees s2's tags and vice versa)
+        s1Node2.Should().NotBeNull();
+        s1Node2!.Tags.Should().ContainKey("datacenter").WhoseValue.Should().Be("east-aws", "node1 should see node2's updated tags");
 
-        // Note: MemberUpdate events are also dependent on the gossip loop and would require
-        // more complex setup to verify. The core functionality (local tag updates) is verified above.
+        s2Node1.Should().NotBeNull();
+        s2Node1!.Tags.Should().ContainKey("port").WhoseValue.Should().Be("8000", "node2 should see node1's updated tags");
 
         await s1.ShutdownAsync();
         await s2.ShutdownAsync();
@@ -172,7 +162,7 @@ public class SerfTagsTest
         // Join nodes
         var joinAddr = $"{s2Addr}:{s2Port}";
         await s1.JoinAsync(new[] { joinAddr }, ignoreOld: false);
-        await Task.Delay(500);
+        await TestHelpers.WaitUntilNumNodesAsync(2, TimeSpan.FromSeconds(10), s1, s2);
 
         s1.NumMembers().Should().Be(2, "should have 2 members after join");
 
@@ -216,14 +206,17 @@ public class SerfTagsTest
             // Rejoin s2 to s1
             var s1Port = config1.MemberlistConfig.BindPort;
             await s2New!.JoinAsync(new[] { $"127.0.0.1:{s1Port}" }, ignoreOld: false);
-            await Task.Delay(500);
 
             // Assert - Check events for MemberJoin
             var events = new List<IEvent>();
-            while (eventChannel.Reader.TryRead(out var evt))
+            await TestHelpers.WaitForConditionAsync(() =>
             {
-                events.Add(evt);
-            }
+                while (eventChannel.Reader.TryRead(out var evt))
+                {
+                    events.Add(evt);
+                }
+                return events.Any(e => e.EventType() == EventType.MemberJoin);
+            }, TimeSpan.FromSeconds(5), "no MemberJoin event was received after the rejoin");
 
             events.Should().Contain(e => e.EventType() == EventType.MemberJoin,
                 "should receive join event");
@@ -286,42 +279,33 @@ public class SerfTagsTest
         // Act - Join nodes
         var s2Port = config2.MemberlistConfig.BindPort;
         await s1.JoinAsync(new[] { $"127.0.0.1:{s2Port}" }, ignoreOld: false);
-        await Task.Delay(500);
+        await TestHelpers.WaitUntilNumNodesAsync(2, TimeSpan.FromSeconds(10), s1, s2);
 
         s1.NumMembers().Should().Be(2);
         s2.NumMembers().Should().Be(2);
 
-        // Assert - Verify each node can see the other's role with retry logic
-        Dictionary<string, string>? s1Roles = null;
-        Dictionary<string, string>? s2Roles = null;
+        // Assert - Verify each node can see the other's role (Go: TestSerf_role checks both members on both nodes)
+        static Dictionary<string, string> Roles(NSerf.Serf.Serf serf) =>
+            serf.Members().ToDictionary(m => m.Name, m => m.Tags.GetValueOrDefault("role", ""));
 
-        for (int i = 0; i < 50; i++)
-        {
-            await Task.Delay(100);
+        await TestHelpers.WaitForConditionAsync(
+            () => Roles(s1).GetValueOrDefault("node1") == "web" &&
+                  Roles(s1).GetValueOrDefault("node2") == "lb" &&
+                  Roles(s2).GetValueOrDefault("node1") == "web" &&
+                  Roles(s2).GetValueOrDefault("node2") == "lb",
+            TimeSpan.FromSeconds(10),
+            () => $"roles not visible cluster-wide: s1 sees [{string.Join(", ", Roles(s1))}], s2 sees [{string.Join(", ", Roles(s2))}]");
 
-            s1Roles = s1.Members().ToDictionary(m => m.Name, m => m.Tags.GetValueOrDefault("role", ""));
-            s2Roles = s2.Members().ToDictionary(m => m.Name, m => m.Tags.GetValueOrDefault("role", ""));
-
-            // Check if both nodes see both roles
-            if (s1Roles.GetValueOrDefault("node1") == "web" &&
-                s1Roles.GetValueOrDefault("node2") == "lb" &&
-                s2Roles.GetValueOrDefault("node1") == "web" &&
-                s2Roles.GetValueOrDefault("node2") == "lb")
-            {
-                break;
-            }
-        }
+        var s1Roles = Roles(s1);
+        var s2Roles = Roles(s2);
 
         // Verify s1 sees both roles
-        s1Roles.Should().NotBeNull();
-        s1Roles!.Should().ContainKey("node1");
-        s1Roles!["node1"].Should().Be("web", "s1 should see its own role");
+        s1Roles.Should().ContainKey("node1").WhoseValue.Should().Be("web", "s1 should see its own role");
+        s1Roles.Should().ContainKey("node2").WhoseValue.Should().Be("lb", "s1 should see node2's role");
 
-        // Note: Cross-node role visibility requires active gossip
-        // For now, verify at least each node sees its own role correctly
-        s2Roles.Should().NotBeNull();
-        s2Roles!.Should().ContainKey("node2");
-        s2Roles!["node2"].Should().Be("lb", "s2 should see its own role");
+        // Verify s2 sees both roles
+        s2Roles.Should().ContainKey("node2").WhoseValue.Should().Be("lb", "s2 should see its own role");
+        s2Roles.Should().ContainKey("node1").WhoseValue.Should().Be("web", "s2 should see node1's role");
 
         await s1.ShutdownAsync();
         await s2.ShutdownAsync();

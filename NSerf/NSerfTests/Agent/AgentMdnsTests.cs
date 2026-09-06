@@ -5,6 +5,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 using NSerf.Agent;
 using System.Net;
 using System.Net.NetworkInformation;
+using NSerfTests.Serf;
 
 namespace NSerfTests.Agent;
 
@@ -44,12 +45,13 @@ public class AgentMdnsTests : IDisposable
             var serviceName = e.ServiceInstanceName.ToString();
             if (serviceName.Contains("node1"))
             {
-                foundServices.Add(serviceName);
+                lock (foundServices) foundServices.Add(serviceName);
             }
         };
 
         discovery.QueryServiceInstances("_serf_test-cluster._tcp");
-        await Task.Delay(2000); // Wait for mDNS responses
+        await TestHelpers.WaitForConditionAsync(() => { lock (foundServices) return foundServices.Count > 0; },
+            TimeSpan.FromSeconds(5), "mDNS query received no response for node1"); // Wait for mDNS responses
 
         // Should have discovered the advertised service
         foundServices.Should().NotBeEmpty("mDNS should discover the advertised service");
@@ -101,7 +103,7 @@ public class AgentMdnsTests : IDisposable
         _mdnsInstances.Add(mdns2);
 
         // Wait for discovery and join (initial poll and join time)
-        await Task.Delay(5000);
+        await WaitForMutualDiscoveryAsync(agent1, "node2", agent2, "node1", TimeSpan.FromSeconds(10));
 
         // Assert - Agents should have joined each other via mDNS discovery
         var finalMembers1 = agent1.Serf?.Members().Length ?? 0;
@@ -140,7 +142,11 @@ public class AgentMdnsTests : IDisposable
         );
         _mdnsInstances.Add(mdns1);
 
-        await Task.Delay(500);
+        // Pacing, not a waitable condition: AgentMdns sends a single query at start-up (then every 60 s)
+        // over the shared MulticastService, and an answer that duplicates node1's just-sent announcement
+        // is suppressed, so node2 must start a couple of seconds after node1 (as the sibling tests do)
+        // for its start-up query to be answered at all.
+        await Task.Delay(2000);
 
         var mdns2 = new AgentMdns(
             agent2,
@@ -154,7 +160,7 @@ public class AgentMdnsTests : IDisposable
         _mdnsInstances.Add(mdns2);
 
         // Wait for initial join
-        await Task.Delay(2000);
+        await WaitForMutualDiscoveryAsync(agent1, "node2", agent2, "node1", TimeSpan.FromSeconds(10));
         
         var membersAfterFirstJoin = agent1.Serf?.Members().Length ?? 0;
 
@@ -301,7 +307,10 @@ public class AgentMdnsTests : IDisposable
         _mdnsInstances.AddRange([mdns1, mdns2, mdns3]);
 
         // Wait for a quiet interval batching (100 ms) + join time
-        await Task.Delay(2000);
+        await TestHelpers.WaitForConditionAsync(
+            () => MemberNames(agent1).Contains("node2") && MemberNames(agent1).Contains("node3"),
+            TimeSpan.FromSeconds(10),
+            () => $"node1 did not discover both peers; members: [{string.Join(", ", MemberNames(agent1))}]");
 
         // Assert - All nodes should have discovered each other in batched joins
         var members1 = agent1.Serf?.Members().Select(m => m.Name).ToList() ?? [];
@@ -334,7 +343,8 @@ public class AgentMdnsTests : IDisposable
         _mdnsInstances.Add(mdns2);
 
         // Wait for the next periodic poll (60 s is too long for tests, but an initial poll should catch it)
-        await Task.Delay(3000);
+        await TestHelpers.WaitForConditionAsync(() => MemberNames(agent1).Contains("node2"), TimeSpan.FromSeconds(10),
+            () => $"node1 did not discover the late-joining node2; members: [{string.Join(", ", MemberNames(agent1))}]");
 
         // Assert - Periodic polling should have discovered the late-joining node
         var members = agent1.Serf?.Members().Select(m => m.Name).ToList() ?? new List<string>();
@@ -384,7 +394,7 @@ public class AgentMdnsTests : IDisposable
         _mdnsInstances.Add(mdns2);
 
         // Wait for discovery
-        await Task.Delay(5000);
+        await WaitForMutualDiscoveryAsync(agent1, "node2", agent2, "node1", TimeSpan.FromSeconds(10));
 
         // Assert - Join should work with a replay flag
         var members1 = agent1.Serf?.Members().Select(m => m.Name).ToList() ?? new List<string>();
@@ -410,7 +420,7 @@ public class AgentMdnsTests : IDisposable
         var mdns2 = new AgentMdns(agent2, false, "node2", "test-cluster", bind, port2, logger: NullLogger.Instance);
         _mdnsInstances.AddRange([mdns1, mdns2]);
 
-        await Task.Delay(2000);
+        await WaitForMutualDiscoveryAsync(agent1, "node2", agent2, "node1", TimeSpan.FromSeconds(10));
         
         // Verify they joined
         var membersBeforeDispose = agent1.Serf?.Members().Length ?? 0;
@@ -473,6 +483,22 @@ public class AgentMdnsTests : IDisposable
 
         // Assert
         mdns.Should().NotBeNull();
+    }
+
+    private static List<string> MemberNames(SerfAgent agent) =>
+        agent.Serf?.Members().Select(m => m.Name).ToList() ?? [];
+
+    /// <summary>
+    /// Polls until <paramref name="a"/> lists <paramref name="expectedOnA"/> and <paramref name="b"/> lists
+    /// <paramref name="expectedOnB"/> as members, i.e. mDNS discovery led to a successful join in both directions.
+    /// </summary>
+    private static Task WaitForMutualDiscoveryAsync(SerfAgent a, string expectedOnA, SerfAgent b, string expectedOnB, TimeSpan timeout)
+    {
+        return TestHelpers.WaitForConditionAsync(
+            () => MemberNames(a).Contains(expectedOnA) && MemberNames(b).Contains(expectedOnB),
+            timeout,
+            () => $"mDNS discovery did not join the agents: a sees [{string.Join(", ", MemberNames(a))}], " +
+            $"b sees [{string.Join(", ", MemberNames(b))}]");
     }
 
     private async Task<SerfAgent> CreateTestAgentAsync(string nodeName, string cluster)

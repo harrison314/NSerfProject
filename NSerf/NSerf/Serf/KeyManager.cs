@@ -157,8 +157,8 @@ public class KeyManager(Serf serf)
         // Broadcast the query
         var queryResp = await _serf.QueryAsync(queryName, payload, queryParams);
 
-        // Set NumNodes from the member count
-        resp.NumNodes = _serf.NumMembers();
+        // Only alive nodes can answer (Go: memberlist.NumMembers() counts alive nodes only)
+        resp.NumNodes = _serf.Members(MemberStatus.Alive).Length;
 
         // Stream and process responses
         // The query timeout (5s) gives enough time for gossip propagation

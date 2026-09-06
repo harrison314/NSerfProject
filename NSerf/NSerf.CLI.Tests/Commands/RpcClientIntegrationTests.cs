@@ -176,7 +176,9 @@ public class RpcClientIntegrationTests : IAsyncLifetime
         Assert.Equal(1, joined);
 
         // Wait for gossip to propagate
-        await Task.Delay(1000);
+        Assert.True(await NSerf.CLI.Tests.Helpers.TestHelper.WaitForConditionAsync(
+            async () => (await _client.MembersAsync()).Length == 2, TimeSpan.FromSeconds(5)),
+            "RPC members never reported both agents after join");
 
         // Verify both agents see each other
         var members1 = await _client.MembersAsync();
@@ -220,7 +222,7 @@ public class RpcClientIntegrationTests : IAsyncLifetime
     /// Test: TestRPCClientForceLeave
     /// Validates ForceLeave RPC call
     /// </summary>
-    [Fact(Timeout = 20000)]
+    [Fact(Timeout = 40000)]
     public async Task RpcClient_ForceLeave_RemovesFailedNode()
     {
         // Arrange - create second agent, join, then kill it
@@ -234,37 +236,29 @@ public class RpcClientIntegrationTests : IAsyncLifetime
 
         // Join
         await _client!.JoinAsync(new[] { agent2Addr }, replay: false);
-        await Task.Delay(1000);
+        Assert.True(await NSerf.CLI.Tests.Helpers.TestHelper.WaitForConditionAsync(
+            async () => (await _client.MembersAsync()).Length == 2, TimeSpan.FromSeconds(5)),
+            "RPC members never reported both agents after join");
 
-        // Kill agent2 (don't dispose cleanly)
-        await fixture2.Agent.ShutdownAsync();
+        // Kill agent2 WITHOUT a graceful leave (Serf-level shutdown only), so agent1 has to detect the
+        // failure through its probes - that is the node force-leave is meant for.
         await fixture2.RpcServer!.DisposeAsync();
+        await fixture2.Agent.Serf.ShutdownAsync();
 
-        // Wait for failure detection (probe timeout + gossip)
-        await Task.Delay(5000);
+        // Wait until agent1 has detected the failure (probe + suspicion timeout)
+        Assert.True(await NSerf.CLI.Tests.Helpers.TestHelper.WaitForConditionAsync(
+            async () => (await _client.MembersAsync()).FirstOrDefault(m => m.Name == agent2Name)?.Status == "failed",
+            TimeSpan.FromSeconds(20)),
+            "agent2 was never detected as failed");
 
         // Act - force leave the failed node
         await _client.ForceLeaveAsync(agent2Name);
 
-        // Poll for status change (failed → left can take time for gossip)
-        string? finalStatus = null;
-        for (int i = 0; i < 10; i++)
-        {
-            await Task.Delay(500);
-            var members = await _client.MembersAsync();
-            var node2 = members.FirstOrDefault(m => m.Name == agent2Name);
-            if (node2 != null)
-            {
-                finalStatus = node2.Status;
-                if (finalStatus == "left")
-                    break;
-            }
-        }
-
-        // Assert - node should eventually be marked as left (or at least still failed, not alive)
-        Assert.NotNull(finalStatus);
-        Assert.NotEqual("alive", finalStatus); // Must not be alive
-                                               // Note: Can be "failed" or "left" depending on gossip timing
+        // Assert - the failed node is now reported as left
+        Assert.True(await NSerf.CLI.Tests.Helpers.TestHelper.WaitForConditionAsync(
+            async () => (await _client.MembersAsync()).FirstOrDefault(m => m.Name == agent2Name)?.Status == "left",
+            TimeSpan.FromSeconds(10)),
+            "force-leave did not mark agent2 as left");
 
         await fixture2.DisposeAsync();
     }
@@ -281,7 +275,8 @@ public class RpcClientIntegrationTests : IAsyncLifetime
 
         // Assert - agent should be shutting down
         // Give it a moment to process
-        await Task.Delay(500);
+        await NSerf.CLI.Tests.Helpers.TestHelper.WaitForConditionAsync(
+            () => _fixture!.Agent!.Serf!.State() is SerfState.SerfLeft or SerfState.SerfShutdown, TimeSpan.FromSeconds(5));
 
         // Agent should be in leaving or shutdown state
         var state = _fixture!.Agent!.Serf!.State();
@@ -305,7 +300,11 @@ public class RpcClientIntegrationTests : IAsyncLifetime
 
         // Act
         await _client!.UpdateTagsAsync(newTags, Array.Empty<string>());
-        await Task.Delay(1000); // Wait for gossip
+        Assert.True(await NSerf.CLI.Tests.Helpers.TestHelper.WaitForConditionAsync(async () =>
+        {
+            var local = (await _client.MembersAsync()).FirstOrDefault(m => m.Name == _fixture!.Agent!.NodeName);
+            return local?.Tags.GetValueOrDefault("role") == "updated" && local.Tags.GetValueOrDefault("new_tag") == "value";
+        }, TimeSpan.FromSeconds(5)), "RPC members never reflected the updated tags"); // Wait for gossip
 
         // Assert
         var members = await _client.MembersAsync();

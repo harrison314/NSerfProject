@@ -33,6 +33,15 @@ public partial class GoDurationJsonConverter : JsonConverter<TimeSpan>
     [GeneratedRegex(@"^(\d+(?:\.\d+)?)(ns|us|µs|ms|s|m|h)$", RegexOptions.CultureInvariant)]
     private static partial Regex DurationRegex();
 
+    /// <summary>
+    /// Parses a Go duration string such as "30s", "100ms" or "1.5h" (Go: time.ParseDuration).
+    /// </summary>
+    public static TimeSpan ParseDuration(string input)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(input);
+        return ParseGoDuration(input.Trim());
+    }
+
     private static TimeSpan ParseGoDuration(string input)
     {
         // Support Go duration format: h (hour), m (minute), s (second), ms (millisecond), us (microsecond), ns (nanosecond)

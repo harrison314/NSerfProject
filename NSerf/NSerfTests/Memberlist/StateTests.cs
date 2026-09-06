@@ -2259,6 +2259,53 @@ public class StateTests
     /// Scenario: Node restarts (inc=0), joins peer, peer sends push/pull with us as Left(inc=10).
     /// Expected: We refute by broadcasting Alive(inc=11+).
     /// </summary>
+    /// <summary>
+    /// A node in the middle of a graceful leave must not resurrect itself when a push/pull shows that a
+    /// peer already recorded it as Left (Go: deadNode refutes only when !hasLeft()). Refuting here would
+    /// flip the node back to Alive on the peer, which then detects a failure instead of the leave.
+    /// </summary>
+    [Fact]
+    public async Task MergeRemoteState_WhileLeaving_ShouldNotRefuteOwnLeftState()
+    {
+        var network = CreateMockNetwork();
+        var config = CreateTestConfig("node1");
+        config.Transport = network.CreateTransport("node1");
+
+        var m = NSerf.Memberlist.Memberlist.Create(config);
+        try
+        {
+            await m.LeaveAsync(TimeSpan.FromMilliseconds(100));
+            m.IsLeaving.Should().BeTrue();
+            var incarnationAfterLeave = m.Incarnation;
+
+            var stateHandler = new StateHandlers(m, config.Logger);
+            stateHandler.MergeRemoteState(new List<PushNodeState>
+            {
+                new PushNodeState
+                {
+                    Name = "node1",
+                    Addr = IPAddress.Parse("127.0.0.1").GetAddressBytes(),
+                    Port = (ushort)config.BindPort,
+                    Incarnation = incarnationAfterLeave,
+                    State = NodeStateType.Left,
+                    Meta = Array.Empty<byte>(),
+                    Vsn = new byte[]
+                    {
+                        ProtocolVersion.Min, ProtocolVersion.Max, config.ProtocolVersion,
+                        config.DelegateProtocolMin, config.DelegateProtocolMax, config.DelegateProtocolVersion
+                    }
+                }
+            });
+
+            m.Incarnation.Should().Be(incarnationAfterLeave, "a leaving node must not refute its own Left tombstone");
+            m.NodeMap["node1"].State.Should().Be(NodeStateType.Left, "the local node stays Left while leaving");
+        }
+        finally
+        {
+            await m.ShutdownAsync();
+        }
+    }
+
     [Fact]
     public async Task MergeRemoteState_LocalNodeInTombstoneState_ShouldRefute()
     {

@@ -218,54 +218,34 @@ public class SerfTagsGetSetPropagationTest
         using var s1 = await NSerf.Serf.Serf.CreateAsync(config1);
         using var s2 = await NSerf.Serf.Serf.CreateAsync(config2);
 
-        await Task.Delay(200);
-
         // Act - Join nodes
         var s2Port = config2.MemberlistConfig.BindPort;
         await s1.JoinAsync(new[] { $"127.0.0.1:{s2Port}" }, ignoreOld: false);
-        await Task.Delay(500);
 
         // Assert - Both nodes should see each other
-        s1.NumMembers().Should().Be(2);
-        s2.NumMembers().Should().Be(2);
+        await TestHelpers.WaitUntilNumNodesAsync(2, TimeSpan.FromSeconds(10), s1, s2);
 
-        // Verify initial tags are visible with retry
-        Member? node1FromS1 = null;
-        Member? node2FromS1 = null;
-        Member? node1FromS2 = null;
-        Member? node2FromS2 = null;
+        // Wait until each node sees the OTHER node's initial tags
+        static string? RoleTagOf(NSerf.Serf.Serf serf, string nodeName) =>
+            serf.Members().FirstOrDefault(m => m.Name == nodeName)?.Tags.GetValueOrDefault("role");
 
-        for (int i = 0; i < 50; i++)
-        {
-            await Task.Delay(100);
-
-            var s1Members = s1.Members();
-            node1FromS1 = s1Members.FirstOrDefault(m => m.Name == "node1");
-            node2FromS1 = s1Members.FirstOrDefault(m => m.Name == "node2");
-
-            var s2Members = s2.Members();
-            node1FromS2 = s2Members.FirstOrDefault(m => m.Name == "node1");
-            node2FromS2 = s2Members.FirstOrDefault(m => m.Name == "node2");
-
-            if (node1FromS1?.Tags.ContainsKey("role") == true &&
-                node2FromS1?.Tags.ContainsKey("role") == true &&
-                node1FromS2?.Tags.ContainsKey("role") == true &&
-                node2FromS2?.Tags.ContainsKey("role") == true)
-            {
-                break;
-            }
-        }
+        await TestHelpers.WaitForConditionAsync(
+            () => RoleTagOf(s1, "node2") == "db" && RoleTagOf(s2, "node1") == "web",
+            TimeSpan.FromSeconds(10),
+            () => $"initial tags not visible remotely: s1 sees node2 role='{RoleTagOf(s1, "node2")}', s2 sees node1 role='{RoleTagOf(s2, "node1")}'");
 
         // Each node should see its own tags via LocalMember()
         s1.LocalMember().Tags.Should().ContainKey("role").WhoseValue.Should().Be("web");
         s2.LocalMember().Tags.Should().ContainKey("role").WhoseValue.Should().Be("db");
 
         // Each node should see the other's tags in Members()
-        node1FromS1.Should().NotBeNull();
-        node1FromS1!.Tags.Should().ContainKey("role").WhoseValue.Should().Be("web");
-        
-        node2FromS2.Should().NotBeNull();
-        node2FromS2!.Tags.Should().ContainKey("role").WhoseValue.Should().Be("db");
+        var node2FromS1 = s1.Members().FirstOrDefault(m => m.Name == "node2");
+        node2FromS1.Should().NotBeNull();
+        node2FromS1!.Tags.Should().ContainKey("role").WhoseValue.Should().Be("db");
+
+        var node1FromS2 = s2.Members().FirstOrDefault(m => m.Name == "node1");
+        node1FromS2.Should().NotBeNull();
+        node1FromS2!.Tags.Should().ContainKey("role").WhoseValue.Should().Be("web");
 
         await s1.ShutdownAsync();
         await s2.ShutdownAsync();
@@ -293,7 +273,6 @@ public class SerfTagsGetSetPropagationTest
         };
 
         using var serf = await NSerf.Serf.Serf.CreateAsync(config);
-        await Task.Delay(200);
 
         // Verify initial tags via LocalMember().Tags
         var initialTags = serf.LocalMember().Tags;
@@ -323,7 +302,7 @@ public class SerfTagsGetSetPropagationTest
     [Fact]
     public async Task MultipleTagUpdates_InSequence_ShouldPropagateAll()
     {
-        // Arrange
+        // Arrange - two nodes, so propagation of the updates can actually be observed
         var config = new Config
         {
             NodeName = "test-node",
@@ -335,8 +314,24 @@ public class SerfTagsGetSetPropagationTest
                 BindPort = 0
             }
         };
+        var observerConfig = new Config
+        {
+            NodeName = "observer",
+            MemberlistConfig = new MemberlistConfig
+            {
+                Name = "observer",
+                BindAddr = "127.0.0.1",
+                BindPort = 0
+            }
+        };
 
         using var serf = await NSerf.Serf.Serf.CreateAsync(config);
+        using var observer = await NSerf.Serf.Serf.CreateAsync(observerConfig);
+        await observer.JoinAsync(new[] { $"127.0.0.1:{config.MemberlistConfig.BindPort}" }, ignoreOld: false);
+        await TestHelpers.WaitUntilNumNodesAsync(2, TimeSpan.FromSeconds(10), serf, observer);
+
+        static string? CounterSeenBy(NSerf.Serf.Serf s) =>
+            s.Members().FirstOrDefault(m => m.Name == "test-node")?.Tags.GetValueOrDefault("counter");
 
         // Act - Perform multiple updates
         for (int i = 1; i <= 5; i++)
@@ -347,11 +342,17 @@ public class SerfTagsGetSetPropagationTest
             await Task.Delay(50); // Small delay between updates
         }
 
-        // Assert - Final value should be "5"
+        // Assert - Final value should be "5" locally and on the observer
         var finalTags = serf.LocalMember().Tags;
         finalTags.Should().ContainKey("counter").WhoseValue.Should().Be("5");
 
+        await TestHelpers.WaitForConditionAsync(
+            () => CounterSeenBy(observer) == "5",
+            TimeSpan.FromSeconds(10),
+            () => $"the observer never saw the final tag value: it sees counter='{CounterSeenBy(observer)}'");
+
         await serf.ShutdownAsync();
+        await observer.ShutdownAsync();
     }
 
     /// <summary>
@@ -402,21 +403,15 @@ public class SerfTagsGetSetPropagationTest
         using var s2 = await NSerf.Serf.Serf.CreateAsync(config2);
         using var s3 = await NSerf.Serf.Serf.CreateAsync(config3);
 
-        await Task.Delay(200);
-
         // Act - Join all nodes
         var s2Port = config2.MemberlistConfig.BindPort;
         var s3Port = config3.MemberlistConfig.BindPort;
-        
+
         await s1.JoinAsync(new[] { $"127.0.0.1:{s2Port}" }, ignoreOld: false);
-        await Task.Delay(300);
         await s1.JoinAsync(new[] { $"127.0.0.1:{s3Port}" }, ignoreOld: false);
-        await Task.Delay(500);
 
         // Assert - All nodes should see 3 members
-        s1.NumMembers().Should().Be(3);
-        s2.NumMembers().Should().Be(3);
-        s3.NumMembers().Should().Be(3);
+        await TestHelpers.WaitUntilNumNodesAsync(3, TimeSpan.FromSeconds(10), s1, s2, s3);
 
         // Verify each node can see its own tags via LocalMember()
         s1.LocalMember().Tags.Should().ContainKey("role").WhoseValue.Should().Be("web");
@@ -428,11 +423,26 @@ public class SerfTagsGetSetPropagationTest
         node1Tags["status"] = "updated";
         await s1.SetTagsAsync(node1Tags);
 
-        // Wait for propagation
-        await Task.Delay(1000);
-
         // Verify node1 sees its own update
         s1.LocalMember().Tags.Should().ContainKey("status").WhoseValue.Should().Be("updated");
+
+        // Wait for propagation - the REMOTE nodes must observe node1's new tag
+        // (Go: TestSerf_SetTags waits until members on the other nodes carry the tag)
+        static string? StatusTagOf(NSerf.Serf.Serf serf, string nodeName) =>
+            serf.Members().FirstOrDefault(m => m.Name == nodeName)?.Tags.GetValueOrDefault("status");
+
+        await TestHelpers.WaitForConditionAsync(
+            () => StatusTagOf(s2, "node1") == "updated" && StatusTagOf(s3, "node1") == "updated",
+            TimeSpan.FromSeconds(10),
+            () => $"node1's tag update did not propagate: node2 sees status='{StatusTagOf(s2, "node1")}', node3 sees status='{StatusTagOf(s3, "node1")}'");
+
+        var node1FromS2 = s2.Members().First(m => m.Name == "node1");
+        node1FromS2.Tags.Should().ContainKey("status").WhoseValue.Should().Be("updated");
+        node1FromS2.Tags.Should().ContainKey("role").WhoseValue.Should().Be("web", "existing tags must survive the update");
+
+        var node1FromS3 = s3.Members().First(m => m.Name == "node1");
+        node1FromS3.Tags.Should().ContainKey("status").WhoseValue.Should().Be("updated");
+        node1FromS3.Tags.Should().ContainKey("role").WhoseValue.Should().Be("web", "existing tags must survive the update");
 
         await s1.ShutdownAsync();
         await s2.ShutdownAsync();

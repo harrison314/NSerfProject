@@ -22,19 +22,21 @@ public class LeaveEventBroadcastTests : IDisposable
     [Fact]
     public async Task Leave_BroadcastsMessageSuccessfully()
     {
-        // ARRANGE: Create a Serf instance
-        var config = GetTestConfig("test-node-1", 19001);
-        var serf = await NSerf.Serf.Serf.CreateAsync(config);
-        _serf.Add(serf);
+        // ARRANGE: two nodes, so the leave has a peer to propagate to
+        var serf1 = await NSerf.Serf.Serf.CreateAsync(GetTestConfig("test-node-1", 19001));
+        var serf2 = await NSerf.Serf.Serf.CreateAsync(GetTestConfig("test-node-13", 19013));
+        _serf.Add(serf1);
+        _serf.Add(serf2);
 
-        // ACT: Call LeaveAsync
-        await serf.LeaveAsync();
+        var joined = await serf2.JoinAsync(new[] { "127.0.0.1:19001" }, ignoreOld: false);
+        Assert.True(joined > 0, "node 13 should join node 1");
+        await NSerfTests.Serf.TestHelpers.WaitUntilNumNodesAsync(2, TimeSpan.FromSeconds(10), serf1, serf2);
 
-        // ASSERT: Check that broadcasts queue has the message
-        var broadcastCount = serf.Broadcasts.Count;
-        _logger.LogInformation("Broadcasts queue count after leave: {Count}", broadcastCount);
+        // ACT: node 1 leaves
+        await serf1.LeaveAsync();
 
-        Assert.True(broadcastCount >= 0, "Broadcasts queue should be accessible");
+        // ASSERT: the leave intent was broadcast - the peer observes node 1 as Left (not Failed)
+        await NSerfTests.Serf.TestHelpers.WaitForMemberStatusAsync(serf2, "test-node-1", NSerf.Serf.MemberStatus.Left, TimeSpan.FromSeconds(10));
     }
 
     [Fact]
@@ -82,7 +84,7 @@ public class LeaveEventBroadcastTests : IDisposable
         Assert.True(joined > 0, "Node2 should successfully join node1");
 
         // Wait for join to stabilize
-        await Task.Delay(500);
+        await NSerfTests.Serf.TestHelpers.WaitUntilNumNodesAsync(2, TimeSpan.FromSeconds(10), serf1, serf2);
 
         // Clear any existing events
         while (eventChannel1.Reader.TryRead(out _)) { }
@@ -140,7 +142,7 @@ public class LeaveEventBroadcastTests : IDisposable
     }
 
     [Fact]
-    public async Task MemberlistDeadMessage_WithNodeEqualsFrom_SetsStateToLeft()
+    public async Task MemberlistDeadMessage_AboutSelfWhileAlive_IsRefuted()
     {
         // ARRANGE: Create a node
         var config = GetTestConfig("test-node-3", 19005);
@@ -150,26 +152,30 @@ public class LeaveEventBroadcastTests : IDisposable
         // Get memberlist reference
         var memberlist = serf.Memberlist;
         Assert.NotNull(memberlist);
+        var incarnationBefore = memberlist.NodeMap["test-node-3"].Incarnation;
 
-        // ACT: Simulate receiving a dead message where Node==From (graceful leave)
+        // ACT: A dead message about ourselves - even a self-announced one, which can only be a stale
+        // leave from a previous incarnation of this node - must be refuted while we are alive.
+        // (Go: deadNode refutes unless hasLeft(); a self-announced death is only honoured by OTHER nodes,
+        // see StateTests.DeadNode_SelfAnnounced_MarksAsLeft.)
         var deadMsg = new NSerf.Memberlist.Messages.Dead
         {
             Node = "test-node-3",
-            From = "test-node-3",  // Same as Node = graceful leave
-            Incarnation = 1
+            From = "test-node-3",
+            Incarnation = incarnationBefore + 1
         };
 
-        // Trigger HandleDeadNode through state handler
         var stateHandler = new StateHandlers(memberlist, _logger);
         stateHandler.HandleDeadNode(deadMsg);
 
-        // ASSERT: Check node state
+        // ASSERT: still alive, with an incarnation that beats the accusation
         var nodeState = memberlist.NodeMap.GetValueOrDefault("test-node-3");
         Assert.NotNull(nodeState);
 
-        _logger.LogInformation("Node state after dead message: {State}", nodeState.State);
+        _logger.LogInformation("Node state after dead message: {State} (incarnation {Inc})", nodeState.State, nodeState.Incarnation);
 
-        Assert.Equal(NSerf.Memberlist.State.NodeStateType.Left, nodeState.State);
+        Assert.Equal(NSerf.Memberlist.State.NodeStateType.Alive, nodeState.State);
+        Assert.True(nodeState.Incarnation > deadMsg.Incarnation, "refutation must bump the incarnation past the accusation");
     }
 
     [Fact]
@@ -185,7 +191,7 @@ public class LeaveEventBroadcastTests : IDisposable
         _serf.Add(serf2);
 
         await serf2.JoinAsync(new[] { "127.0.0.1:19006" }, ignoreOld: false);
-        await Task.Delay(500);
+        await NSerfTests.Serf.TestHelpers.WaitUntilNumNodesAsync(2, TimeSpan.FromSeconds(10), serf1, serf2);
 
         var memberlist1 = serf1.Memberlist!;
 
@@ -320,7 +326,7 @@ public class LeaveEventBroadcastTests : IDisposable
 
         // Join them
         await serf2.JoinAsync(new[] { "127.0.0.1:19011" }, ignoreOld: false);
-        await Task.Delay(500);
+        await NSerfTests.Serf.TestHelpers.WaitUntilNumNodesAsync(2, TimeSpan.FromSeconds(10), serf1, serf2);
 
         var memberlist1 = serf1.Memberlist!;
         var stateHandler = new StateHandlers(memberlist1, _logger);

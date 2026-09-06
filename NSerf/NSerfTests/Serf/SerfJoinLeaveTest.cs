@@ -422,7 +422,7 @@ public class SerfJoinLeaveTest
             "join broadcast should be queued after successful join");
 
         // Verify both nodes see each other
-        await Task.Delay(500); // Allow time for convergence
+        await TestHelpers.WaitUntilNumNodesAsync(2, TimeSpan.FromSeconds(10), s1, s2); // Allow time for convergence
         s1.NumMembers().Should().Be(2, "s1 should see both members");
         s2.NumMembers().Should().Be(2, "s2 should see both members");
 

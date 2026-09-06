@@ -73,7 +73,7 @@ public sealed class NSerfClusterHttpIntegrationTests : IAsyncLifetime
         // Join cluster
         await node2.JoinAsync(["127.0.0.1:7946"], false);
         await node3.JoinAsync(["127.0.0.1:7946"], false);
-        await Task.Delay(2000); // Wait for cluster to stabilize
+        await NSerfTests.Serf.TestHelpers.WaitUntilNumNodesAsync(3, TimeSpan.FromSeconds(10), _serfNodes.ToArray()); // Wait for cluster to stabilize
 
         _output.WriteLine($"Cluster formed: {_serfNodes.Count} nodes");
 
@@ -81,7 +81,8 @@ public sealed class NSerfClusterHttpIntegrationTests : IAsyncLifetime
         SetupHttpClient();
 
         // Wait for service discovery
-        await Task.Delay(3000);
+        await WaitForHealthyInstancesAsync("api", 2);
+        await WaitForHealthyInstancesAsync("catalog", 1);
 
         var apiInstances = _registry.GetHealthyInstances("api");
         var catalogInstances = _registry.GetHealthyInstances("catalog");
@@ -120,7 +121,7 @@ public sealed class NSerfClusterHttpIntegrationTests : IAsyncLifetime
         // Arrange - Start with 1 node
         _ = await CreateNodeWithServiceAsync("node1", 7950, "api", 8010);
         SetupHttpClient();
-        await Task.Delay(2000);
+        await WaitForHealthyInstancesAsync("api", 1);
 
         var client = _httpClientFactory!.CreateClient();
 
@@ -135,7 +136,7 @@ public sealed class NSerfClusterHttpIntegrationTests : IAsyncLifetime
         _output.WriteLine("Adding node2...");
         var node2 = await CreateNodeWithServiceAsync("node2", 7951, "api", 8011);
         await node2.JoinAsync(["127.0.0.1:7950"], false);
-        await Task.Delay(3000); // Wait for discovery
+        await WaitForHealthyInstancesAsync("api", 2); // Wait for discovery
 
         var updatedInstances = _registry.GetHealthyInstances("api");
         _output.WriteLine($"Updated instances: {updatedInstances.Count}");
@@ -171,7 +172,7 @@ public sealed class NSerfClusterHttpIntegrationTests : IAsyncLifetime
         await node2.JoinAsync(["127.0.0.1:7960"], false);
         
         SetupHttpClient();
-        await Task.Delay(3000);
+        await WaitForHealthyInstancesAsync("api", 2);
 
         var initialInstances = _registry.GetHealthyInstances("api");
         _output.WriteLine($"Initial instances: {initialInstances.Count}");
@@ -182,7 +183,8 @@ public sealed class NSerfClusterHttpIntegrationTests : IAsyncLifetime
         // Act - Node2 leaves
         _output.WriteLine("Node2 leaving cluster...");
         await node2.LeaveAsync();
-        await Task.Delay(3000); // Wait for leave to propagate
+        await NSerfTests.Serf.TestHelpers.WaitForConditionAsync(() => _registry.GetHealthyInstances("api").Count == 1,
+            TimeSpan.FromSeconds(10), () => $"registry still has {_registry.GetHealthyInstances("api").Count} healthy 'api' instances after node2 left"); // Wait for leave to propagate
 
         var remainingInstances = _registry.GetHealthyInstances("api");
         _output.WriteLine($"Remaining instances: {remainingInstances.Count}");
@@ -210,7 +212,9 @@ public sealed class NSerfClusterHttpIntegrationTests : IAsyncLifetime
         await node3.JoinAsync(["127.0.0.1:7970"], false);
         
         SetupHttpClient();
-        await Task.Delay(3000);
+        await WaitForHealthyInstancesAsync("api", 1);
+        await WaitForHealthyInstancesAsync("db", 1);
+        await WaitForHealthyInstancesAsync("cache", 1);
 
         var client = _httpClientFactory!.CreateClient();
 
@@ -248,7 +252,7 @@ public sealed class NSerfClusterHttpIntegrationTests : IAsyncLifetime
         
         // Setup HTTP client with weighted random strategy
         SetupHttpClient(LoadBalancingStrategy.WeightedRandom);
-        await Task.Delay(3000);
+        await WaitForHealthyInstancesAsync("api", 2);
 
         var client = _httpClientFactory!.CreateClient();
         var responseCounts = new Dictionary<string, int>();
@@ -292,7 +296,7 @@ public sealed class NSerfClusterHttpIntegrationTests : IAsyncLifetime
 
         _ = await CreateNodeAsync("node1", 7990, tags, 8050);
         SetupHttpClient();
-        await Task.Delay(2000);
+        await WaitForHealthyInstancesAsync("api", 1);
 
         // Assert - Metadata should be in registry
         var instances = _registry.GetHealthyInstances("api");
@@ -306,6 +310,15 @@ public sealed class NSerfClusterHttpIntegrationTests : IAsyncLifetime
         Assert.Equal(100, instance.Weight);
 
         _output.WriteLine($"Instance metadata: {string.Join(", ", instance.Metadata.Select(kv => $"{kv.Key}={kv.Value}"))}");
+    }
+
+    /// <summary>Polls the registry until <paramref name="serviceName"/> has at least <paramref name="minCount"/> healthy instances.</summary>
+    private Task WaitForHealthyInstancesAsync(string serviceName, int minCount)
+    {
+        return NSerfTests.Serf.TestHelpers.WaitForConditionAsync(
+            () => _registry.GetHealthyInstances(serviceName).Count >= minCount,
+            TimeSpan.FromSeconds(10),
+            () => $"registry never reached {minCount} healthy '{serviceName}' instances (has {_registry.GetHealthyInstances(serviceName).Count})");
     }
 
     private async Task<NSerf.Serf.Serf> CreateNodeWithServiceAsync(

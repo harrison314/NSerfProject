@@ -1,6 +1,6 @@
 // Copyright (c) BoolHak, Inc.
 // SPDX-License-Identifier: MPL-2.0
-// Phase 9.4: Background Tasks (Reaper and Reconnect)
+// Ported from: github.com/hashicorp/serf/serf/serf.go (handleReap, handleReconnect, checkQueueDepth)
 
 using Microsoft.Extensions.Logging;
 using NSerf.Serf.Events;

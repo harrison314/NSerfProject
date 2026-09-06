@@ -27,7 +27,6 @@ builder.Services.AddNSerf(options =>
     options.RejoinAfterLeave = true;
     
     // Enable snapshot persistence
-    // Enable snapshot persistence
     var snapshotDir = Path.Combine(AppContext.BaseDirectory, "snapshots");
     Directory.CreateDirectory(snapshotDir);
     options.SnapshotPath = Path.Combine(snapshotDir, "serf.snapshot");
@@ -43,7 +42,6 @@ builder.Services.AddNSerf(options =>
     if (string.IsNullOrEmpty(joinNode)) return;
     
     options.StartJoin = [joinNode];
-    options.RetryJoin = [joinNode];
     options.RetryJoin = [joinNode];
 });
 

@@ -57,7 +57,8 @@ public class AgentLifecycleIntegrationTests
 
         await using var agent2 = new SerfAgent(config);
         await agent2.StartAsync();
-        await Task.Delay(2000);
+        Assert.True(await NSerf.CLI.Tests.Helpers.TestHelper.WaitForConditionAsync(() => agent1.Agent.Serf.Members().Length == 2, TimeSpan.FromSeconds(5)),
+            "agent1 never saw agent2 after StartJoin");
         
         var members1 = agent1.Agent.Serf.Members();
         Assert.Equal(2, members1.Length);
@@ -85,7 +86,7 @@ public class AgentLifecycleIntegrationTests
         var config = new AgentConfig
         {
             NodeName = TestHelper.GetRandomNodeName(),
-            BindAddr = $"{TestHelper.GetRandomBindAddr()}:0",  // Add port
+            BindAddr = TestHelper.GetRandomBindAddr(),
             RpcAddr = "127.0.0.1:0",
             AdvertiseAddr = advertiseAddr
         };
@@ -213,9 +214,10 @@ public static class TestHelper
         return $"test-node-{Interlocked.Increment(ref _nodeCounter)}";
     }
     
-    public static string GetRandomBindAddr()
-    {
-        var random = new Random();
-        return $"127.0.0.{random.Next(1, 255)}";
-    }
+    /// <summary>
+    /// Bind address for test agents: loopback with an OS-assigned port. Binding to 127.0.0.x
+    /// aliases only works on Linux/Windows (macOS only routes 127.0.0.1 by default), and the
+    /// random port keeps the agents started by one test from colliding.
+    /// </summary>
+    public static string GetRandomBindAddr() => "127.0.0.1:0";
 }

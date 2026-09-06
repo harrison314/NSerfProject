@@ -139,7 +139,7 @@ builder.Services.AddNSerf(options =>
 ## 🧪 Battle-Tested
 
 - 1260+ comprehensive tests
--  Full Serf 1.6.x protocol compatibility
+-  Serf 1.6.x feature parity (behaviour and API). Not wire compatible with Go Serf: clusters must consist of NSerf nodes only
 -  Production-ready encryption
 -  Cross-platform support (Windows, Linux, macOS)
 

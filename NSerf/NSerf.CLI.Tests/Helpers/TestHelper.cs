@@ -16,6 +16,8 @@ public static class TestHelper
     /// <summary>
     /// Creates a test agent with default configuration.
     /// </summary>
+    private static int _agentCounter;
+
     public static async Task<SerfAgent> CreateTestAgentAsync(
         string? bindAddr = null,
         CancellationToken cancellationToken = default)
@@ -24,7 +26,7 @@ public static class TestHelper
         
         var config = new AgentConfig
         {
-            NodeName = actualBindAddr,
+            NodeName = $"test-agent-{Interlocked.Increment(ref _agentCounter)}",
             BindAddr = actualBindAddr + ":0", // Random port
             Tags = new Dictionary<string, string>
             {
@@ -58,11 +60,12 @@ public static class TestHelper
     }
 
     /// <summary>
-    /// Gets a random available bind address.
+    /// Gets the loopback bind address for test agents. 127.0.0.x aliases are only routable on
+    /// Linux/Windows (macOS only has 127.0.0.1 by default), so agents are separated by port instead.
     /// </summary>
     public static string GetRandomBindAddr()
     {
-        return $"127.0.0.{Random.Shared.Next(2, 255)}";
+        return "127.0.0.1";
     }
 
     /// <summary>
@@ -100,6 +103,26 @@ public static class TestHelper
             await Task.Delay(50);
         }
         
+        return false;
+    }
+
+    /// <summary>
+    /// Waits for an asynchronous condition (e.g. an RPC round-trip) with timeout.
+    /// </summary>
+    public static async Task<bool> WaitForConditionAsync(
+        Func<Task<bool>> condition,
+        TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+
+        while (DateTime.UtcNow < deadline)
+        {
+            if (await condition())
+                return true;
+
+            await Task.Delay(50);
+        }
+
         return false;
     }
 }

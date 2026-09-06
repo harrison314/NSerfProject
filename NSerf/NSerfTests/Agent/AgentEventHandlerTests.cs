@@ -26,7 +26,7 @@ public class AgentEventHandlerTests
         await agent.StartAsync();
 
         // Wait for initial MemberJoin event (local node) to be processed
-        await Task.Delay(100);
+        await WaitForEventCountAsync(handler, 1);
 
         // Clear initial event
         handler.ReceivedEvents.Clear();
@@ -40,7 +40,7 @@ public class AgentEventHandlerTests
         await eventChannel.Writer.WriteAsync(testEvent);
 
         // Wait for event loop to process
-        await Task.Delay(100);
+        await WaitForEventCountAsync(handler, 1);
 
         // Verify handler received the test event
         Assert.Single(handler.ReceivedEvents);
@@ -70,7 +70,7 @@ public class AgentEventHandlerTests
         await agent.StartAsync();
 
         // Wait for initial MemberJoin event (local node) to be processed
-        await Task.Delay(100);
+        await WaitForEventCountAsync(handler3, 1);
 
         // Clear initial events
         handler1.ReceivedEvents.Clear();
@@ -83,7 +83,9 @@ public class AgentEventHandlerTests
         var testEvent = new MemberEvent { Type = EventType.MemberJoin };
         await eventChannel.Writer.WriteAsync(testEvent);
 
-        await Task.Delay(100);
+        await WaitForEventCountAsync(handler1, 1);
+        await WaitForEventCountAsync(handler2, 1);
+        await WaitForEventCountAsync(handler3, 1);
 
         // All handlers should receive the test event
         Assert.Single(handler1.ReceivedEvents);
@@ -111,7 +113,7 @@ public class AgentEventHandlerTests
         await agent.StartAsync();
 
         // Wait for initial MemberJoin event (local node) to be processed
-        await Task.Delay(100);
+        await WaitForEventCountAsync(handler, 1);
 
         // Clear initial event
         handler.ReceivedEvents.Clear();
@@ -122,7 +124,8 @@ public class AgentEventHandlerTests
         var testEvent = new MemberEvent { Type = EventType.MemberJoin };
         await eventChannel.Writer.WriteAsync(testEvent);
 
-        await Task.Delay(100);
+        await WaitForEventCountAsync(handler, 1);
+        await Task.Delay(100); // negative check: no duplicate deliveries may arrive afterwards
 
         // Handler should receive test event only once (HashSet deduplication)
         Assert.Single(handler.ReceivedEvents);
@@ -145,7 +148,7 @@ public class AgentEventHandlerTests
         await agent.StartAsync();
 
         // Wait for initial MemberJoin event (local node) to be processed
-        await Task.Delay(100);
+        await WaitForEventCountAsync(handler, 1);
 
         // Deregister handler and clear any received events
         agent.DeregisterEventHandler(handler);
@@ -184,7 +187,7 @@ public class AgentEventHandlerTests
         await agent.StartAsync();
 
         // Wait for initial MemberJoin event (local node) to be processed
-        await Task.Delay(100);
+        await WaitForEventCountAsync(handler2, 1);
 
         // Clear initial events (local node join)
         handler1.ReceivedEvents.Clear();
@@ -197,7 +200,8 @@ public class AgentEventHandlerTests
         await eventChannel.Writer.WriteAsync(new MemberEvent { Type = EventType.MemberJoin });
         await eventChannel.Writer.WriteAsync(new MemberEvent { Type = EventType.MemberLeave });
 
-        await Task.Delay(200);
+        await WaitForEventCountAsync(handler1, 2);
+        await WaitForEventCountAsync(handler2, 2);
 
         // Both handlers should receive both test events
         Assert.Equal(2, handler1.ReceivedEvents.Count);
@@ -225,7 +229,7 @@ public class AgentEventHandlerTests
         await agent.StartAsync();
 
         // Wait for initial MemberJoin event (local node) to be processed
-        await Task.Delay(100);
+        await WaitForEventCountAsync(normalHandler, 1);
 
         // Clear initial events
         normalHandler.ReceivedEvents.Clear();
@@ -235,15 +239,24 @@ public class AgentEventHandlerTests
         var eventChannel = (Channel<IEvent>)eventChannelField!.GetValue(agent)!;
 
         await eventChannel.Writer.WriteAsync(new MemberEvent { Type = EventType.MemberJoin });
-        await Task.Delay(100);
+        await WaitForEventCountAsync(normalHandler, 1);
         await eventChannel.Writer.WriteAsync(new MemberEvent { Type = EventType.MemberLeave });
-        await Task.Delay(100);
+        await WaitForEventCountAsync(normalHandler, 2);
 
         // Normal handler should receive both test events despite throwing handler
         Assert.Equal(2, normalHandler.ReceivedEvents.Count);
         Assert.NotNull(agent.Serf);
 
         await agent.DisposeAsync();
+    }
+
+    /// <summary>Polls until the handler has received at least <paramref name="count"/> events.</summary>
+    private static Task WaitForEventCountAsync(TestEventHandler handler, int count)
+    {
+        return NSerfTests.Serf.TestHelpers.WaitForConditionAsync(
+            () => handler.Count >= count,
+            TimeSpan.FromSeconds(5),
+            () => $"handler received {handler.Count} events, expected at least {count}");
     }
 }
 
@@ -253,7 +266,16 @@ public class TestEventHandler : IEventHandler
 
     public void HandleEvent(IEvent @event)
     {
-        ReceivedEvents.Add(@event);
+        lock (ReceivedEvents)
+        {
+            ReceivedEvents.Add(@event);
+        }
+    }
+
+    /// <summary>Thread-safe count for polling from the test thread while the agent event loop delivers.</summary>
+    public int Count
+    {
+        get { lock (ReceivedEvents) return ReceivedEvents.Count; }
     }
 }
 

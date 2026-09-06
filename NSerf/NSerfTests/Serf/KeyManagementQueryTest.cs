@@ -247,7 +247,8 @@ public class KeyManagementQueryTest
         await inCh.WriteAsync(query);
 
         // Wait for processing
-        await Task.Delay(200);
+        await TestHelpers.WaitForConditionAsync(() => keyring.GetKeys().Count == 2, TimeSpan.FromSeconds(5),
+            () => $"install-key query was not applied; keyring has {keyring.GetKeys().Count} keys");
 
         // Assert - New key should be added
         keyring.GetKeys().Should().HaveCount(2, "new key should have been installed");
@@ -321,7 +322,8 @@ public class KeyManagementQueryTest
             await inCh.WriteAsync(query);
 
             // Wait for processing
-            await Task.Delay(300);
+            await TestHelpers.WaitForConditionAsync(() => File.Exists(keyringFile), TimeSpan.FromSeconds(5),
+                "keyring file was not written after install-key query");
 
             // Assert - Keyring file should be written
             File.Exists(keyringFile).Should().BeTrue("keyring file should be written after install");
@@ -473,7 +475,8 @@ public class KeyManagementQueryTest
         await inCh.WriteAsync(query);
 
         // Wait for processing
-        await Task.Delay(200);
+        await TestHelpers.WaitForConditionAsync(() => keyring.GetPrimaryKey()!.SequenceEqual(key2Bytes), TimeSpan.FromSeconds(5),
+            "use-key query did not change the primary key");
 
         // Assert - Primary key should have changed
         var newPrimaryKey = keyring.GetPrimaryKey();
@@ -603,7 +606,8 @@ public class KeyManagementQueryTest
         await inCh.WriteAsync(query);
 
         // Wait for processing
-        await Task.Delay(200);
+        await TestHelpers.WaitForConditionAsync(() => keyring.GetKeys().Count == 1, TimeSpan.FromSeconds(5),
+            () => $"remove-key query was not applied; keyring has {keyring.GetKeys().Count} keys");
 
         // Assert - Key should have been removed
         keyring.GetKeys().Should().HaveCount(1, "key2 should have been removed");
@@ -741,7 +745,8 @@ public class KeyManagementQueryTest
             await inCh.WriteAsync(query);
 
             // Wait for processing
-            await Task.Delay(300);
+            await TestHelpers.WaitForConditionAsync(() => File.Exists(keyringFile), TimeSpan.FromSeconds(5),
+                "keyring file was not written after use-key query");
 
             // Assert - Keyring file should be written with new primary key first
             File.Exists(keyringFile).Should().BeTrue("keyring file should be written");

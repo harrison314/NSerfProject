@@ -157,7 +157,7 @@ public class SerfFailureTest
         await s1.JoinAsync(new[] { $"127.0.0.1:{config3.MemberlistConfig.BindPort}" }, false);
 
         // Wait for cluster convergence
-        await Task.Delay(200);
+        await TestHelpers.WaitUntilNumNodesAsync(3, TimeSpan.FromSeconds(10), s1, s2, s3);
 
         // Shutdown s2 to simulate failure
         await s2.ShutdownAsync();
@@ -207,7 +207,7 @@ public class SerfFailureTest
         using var s2 = await NSerf.Serf.Serf.CreateAsync(config2);
 
         await s1.JoinAsync(new[] { $"127.0.0.1:{config2.MemberlistConfig.BindPort}" }, false);
-        await Task.Delay(100);
+        await TestHelpers.WaitUntilNumNodesAsync(2, TimeSpan.FromSeconds(10), s1, s2);
 
         await s2.ShutdownAsync();
         await Task.Delay(200);
@@ -289,14 +289,17 @@ public class SerfFailureTest
 
         // Act - Join
         await s1.JoinAsync(new[] { $"127.0.0.1:{config2.MemberlistConfig.BindPort}" }, false);
-        await Task.Delay(100);
 
         // Assert - Should have join event
         var events = new List<IEvent>();
-        while (eventChannel.Reader.TryRead(out var evt))
+        await TestHelpers.WaitForConditionAsync(() =>
         {
-            events.Add(evt);
-        }
+            while (eventChannel.Reader.TryRead(out var evt))
+            {
+                events.Add(evt);
+            }
+            return events.Any(e => e.EventType() == EventType.MemberJoin);
+        }, TimeSpan.FromSeconds(5), "no MemberJoin event was received after join");
 
         events.Should().Contain(e => e.EventType() == EventType.MemberJoin);
 
@@ -341,7 +344,7 @@ public class SerfFailureTest
         using var s2 = await NSerf.Serf.Serf.CreateAsync(config2);
 
         await s1.JoinAsync(new[] { $"127.0.0.1:{config2.MemberlistConfig.BindPort}" }, false);
-        await Task.Delay(100);
+        await TestHelpers.WaitUntilNumNodesAsync(2, TimeSpan.FromSeconds(10), s1, s2);
 
         // Clear join events
         while (eventChannel.Reader.TryRead(out _)) { }
@@ -408,7 +411,7 @@ public class SerfFailureTest
         using var s2 = await NSerf.Serf.Serf.CreateAsync(config2);
 
         await s1.JoinAsync(new[] { $"127.0.0.1:{config2.MemberlistConfig.BindPort}" }, false);
-        await Task.Delay(100);
+        await TestHelpers.WaitUntilNumNodesAsync(2, TimeSpan.FromSeconds(10), s1, s2);
 
         // Act - Shutdown s2 to simulate failure
         await s2.ShutdownAsync();
@@ -457,7 +460,8 @@ public class SerfFailureTest
 
         // Act
         await s1.JoinAsync(new[] { $"127.0.0.1:{config2.MemberlistConfig.BindPort}" }, false);
-        await Task.Delay(100);
+        await TestHelpers.WaitForConditionAsync(() => s1.Members().Length == 2, TimeSpan.FromSeconds(10),
+            () => $"s1 sees {s1.Members().Length} members, expected 2");
 
         // Assert
         var members = s1.Members();

@@ -78,7 +78,8 @@ public class AgentConfig(bool replayOnJoin = false)
 
     public static AgentConfig Merge(AgentConfig a, AgentConfig b)
     {
-        var result = new AgentConfig();
+        // ReplayOnJoin is init-only, so it has to be carried over here (Go: if b.ReplayOnJoin { result.ReplayOnJoin = true })
+        var result = new AgentConfig(replayOnJoin: a.ReplayOnJoin || b.ReplayOnJoin);
 
         MergeScalars(a, b, result);
         MergeIntegers(a, b, result);

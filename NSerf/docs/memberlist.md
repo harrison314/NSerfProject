@@ -131,4 +131,8 @@ Conceptually:
 3. **Serf.CreateAsync(Config)** – uses `Config.MemberlistConfig` to create and initialize `Memberlist`.
 4. **Runtime** – memberlist runs its probe/gossip loops and notifies Serf of membership changes.
 
+## Wire Format
+
+Messages are MessagePack **arrays** (`[MessagePackObject]` with integer `[Key(n)]`) whose element order follows the Go struct field order (for example `alive` = `[Incarnation, Node, Addr, Port, Meta, Vsn]`, `dead` = `[Incarnation, Node, From]`), prefixed by the memberlist message-type byte. Go memberlist encodes the same structs as maps keyed by field name and wraps compressed payloads in a `compress{Algo: LZW, Buf}` struct, whereas NSerf writes the raw GZip stream directly after the `compress` type byte (no `compress` struct). NSerf and Go memberlist/Serf nodes therefore cannot gossip with each other: a cluster must consist of NSerf nodes only. The encoding is pinned by `NSerfTests/Serf/WireFormatTests.cs`; see the repository README section "Wire Format and Interoperability" for the full comparison.
+
 For higher-level behavior such as join/leave semantics and compression usage, see the Serf core and Agent documentation.

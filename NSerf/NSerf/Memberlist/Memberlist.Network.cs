@@ -102,37 +102,47 @@ public partial class Memberlist
     }
 
     /// <summary>
-    /// Probes a specific node to check if it's alive using UDP ping.
+    /// Handles a single round of failure checking on a node (Go: probeNode).
+    /// Sends a direct UDP ping; on timeout falls back to indirect pings through random alive peers
+    /// and a TCP ping, and marks the node suspect if nothing answers within the probe interval.
     /// </summary>
-    private async Task ProbeNodeAsync(NodeState node)
+    internal async Task ProbeNodeAsync(NodeState node)
     {
         _logger?.LogDebug("Probing node: {Node}", node.Name);
 
-        // Get a sequence number for this probe
-        var seqNo = NextSequenceNum();
+        // We use our health awareness to scale the overall probe interval, so we
+        // slow down if we detect that we are being degraded.
+        var probeInterval = Awareness.ScaleTimeout(Config.ProbeInterval);
+        var probeTimeout = Awareness.ScaleTimeout(Config.ProbeTimeout);
+        if (probeInterval > Config.ProbeInterval)
+        {
+            _logger?.LogDebug("Probe of {Node} running degraded: interval scaled to {Interval}", node.Name, probeInterval);
+        }
 
-        // Setup ack handler to wait for response
-        var ackReceived = new TaskCompletionSource<bool>();
+        // Prepare a ping message and set up the ack/nack handler. The handler lives for the
+        // whole probe interval so that late (indirect) acks are still delivered.
+        var seqNo = NextSequenceNum();
+        var ackReceived = new TaskCompletionSource<(byte[] Payload, DateTimeOffset Timestamp)?>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var nacksReceived = 0;
         var handler = new AckNackHandler(_logger);
 
         handler.SetAckHandler(
             seqNo,
-            (_, _) =>
-            {
-                ackReceived.TrySetResult(true); // Success
-            },
-            () =>
-            {
-                ackReceived.TrySetResult(false); // Timeout/Nack
-            },
-            Config.ProbeTimeout
+            (payload, timestamp) => ackReceived.TrySetResult((payload, timestamp)),
+            () => Interlocked.Increment(ref nacksReceived),
+            () => ackReceived.TrySetResult(null), // probe interval elapsed without an ack
+            probeInterval
         );
 
         AckHandlers[seqNo] = handler;
 
+        // Any return after the ping has been sent means the probe succeeded, which improves
+        // our health; the failure paths at the end overwrite this delta.
+        var awarenessDelta = 0;
+
         try
         {
-            // Encode ping using MessagePack like Go implementation
             var (advertiseAddr, advertisePort) = GetAdvertiseAddr();
             var pingMsg = new PingMessage
             {
@@ -150,10 +160,84 @@ public partial class Memberlist
                 Name = node.Name
             };
 
-            await SendPacketAsync(pingBytes, addr, _shutdownCts.Token);
+            // Mark the sent time before the actual send so RTT measurements never go negative.
+            var sent = DateTimeOffset.UtcNow;
+            var deadline = sent + probeInterval;
 
-            // Start TCP fallback in parallel if enabled and node supports it
-            // Go implementation does this for a protocol version >= 3
+            await SendPacketAsync(pingBytes, addr, _shutdownCts.Token);
+            awarenessDelta = -1;
+
+            // Wait for the direct ack or the probe timeout
+            var directAck = await WaitForAckAsync(ackReceived.Task, probeTimeout);
+            if (directAck is { } ack)
+            {
+                if (Config.Ping != null)
+                {
+                    var rtt = ack.Timestamp - sent;
+                    Config.Ping.NotifyPingComplete(node.Node, rtt, ack.Payload);
+                }
+
+                OnProbeSucceeded(node);
+                return;
+            }
+
+            if (!ackReceived.Task.IsCompleted)
+            {
+                _logger?.LogDebug("Failed UDP ping: {Node} (timeout reached)", node.Name);
+            }
+
+            // Get some random live nodes to ask for an indirect ping
+            List<Node> kNodes;
+            lock (NodeLock)
+            {
+                kNodes = NodeStateManager.KRandomNodes(Config.IndirectChecks, Nodes, n =>
+                    n.Name == Config.Name ||
+                    n.Name == node.Name ||
+                    n.State != NodeStateType.Alive);
+            }
+
+            // Attempt an indirect ping. We only expect nacks from peers who understand
+            // version 4 of the protocol.
+            var expectedNacks = 0;
+            foreach (var peer in kNodes)
+            {
+                var ind = new IndirectPingMessage
+                {
+                    SeqNo = seqNo,
+                    Target = node.Node.Addr.GetAddressBytes(),
+                    Port = node.Node.Port,
+                    Node = node.Name,
+                    Nack = peer.PMax >= 4,
+                    SourceAddr = advertiseAddr.GetAddressBytes(),
+                    SourcePort = (ushort)advertisePort,
+                    SourceNode = Config.Name
+                };
+
+                if (ind.Nack)
+                {
+                    expectedNacks++;
+                }
+
+                try
+                {
+                    var indBytes = MessageEncoder.Encode(MessageType.IndirectPing, ind);
+                    var peerAddr = new Address { Addr = $"{peer.Addr}:{peer.Port}", Name = peer.Name };
+                    await SendPacketAsync(indBytes, peerAddr, _shutdownCts.Token);
+                }
+                catch (OperationCanceledException) when (_shutdownCts.IsCancellationRequested)
+                {
+                    // Shutting down: handled by the probe's own cancellation path, not an error
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogError(ex, "Failed to send indirect ping to {Peer}", peer.Name);
+                }
+            }
+
+            // Also make an attempt to contact the node directly over TCP. This helps prevent
+            // confused clients who get isolated from UDP traffic but can still speak TCP.
+            // Go implementation does this for a protocol version >= 3.
             var tcpFallbackTask = Task.FromResult(false);
             var disableTcpPings = Config.DisableTcpPings ||
                                   (Config.DisableTcpPingsForNode != null && Config.DisableTcpPingsForNode(node.Name));
@@ -164,7 +248,6 @@ public partial class Memberlist
                 {
                     try
                     {
-                        var deadline = DateTimeOffset.UtcNow.Add(Config.ProbeTimeout);
                         var didContact = await SendPingAndWaitForAckAsync(addr, pingMsg, deadline, _shutdownCts.Token);
                         return didContact;
                     }
@@ -176,29 +259,18 @@ public partial class Memberlist
                 });
             }
 
-            // Wait for UDP ack or timeout
-            var success = await ackReceived.Task;
-
-            if (success)
+            // Wait for an (indirect) ack until the probe interval elapses. The TCP fallback is
+            // deliberately not consulted here: we only want to warn about it below if that is
+            // the *only* way we hear back from the peer.
+            var lateAck = await WaitForAckAsync(ackReceived.Task, Timeout.InfiniteTimeSpan);
+            if (lateAck != null)
             {
-                _logger?.LogDebug("Probe successful for node: {Node}", node.Name);
-
-                // Cancel any suspicion timer since the node responded successfully
-                if (!NodeTimers.TryRemove(node.Name, out var timerObj) || timerObj is not Suspicion suspicion) return;
-
-                try
-                {
-                    suspicion.Dispose();
-                }
-                catch (ObjectDisposedException)
-                {
-                    // Timer already disposed, safe to ignore
-                }
-
+                OnProbeSucceeded(node);
                 return;
             }
 
-            // UDP failed, check a TCP fallback result
+            // Finally, poll the TCP fallback. Its deadline matches the probe interval, so it is
+            // already complete (or about to be) by now.
             var tcpSuccess = await tcpFallbackTask;
             if (tcpSuccess)
             {
@@ -207,18 +279,15 @@ public partial class Memberlist
                     node.Name);
 
                 // Cancel any suspicion timer
-                if (!NodeTimers.TryRemove(node.Name, out var timerObj) || timerObj is not Suspicion suspicion) return;
-                try
-                {
-                    suspicion.Dispose();
-                }
-                catch (ObjectDisposedException)
-                {
-                    // Timer already disposed, safe to ignore
-                }
-
+                ClearSuspicionTimer(node);
                 return;
             }
+
+            // Update our self-awareness based on the results of this failed probe. If we don't have
+            // peers to send indirect probes to, we set awarenessDelta to 1. Otherwise, we set it based
+            // on the number of failed indirect probes.
+            var nackCount = Volatile.Read(ref nacksReceived);
+            awarenessDelta = expectedNacks > 0 ? Math.Max(0, expectedNacks - nackCount) : 1;
 
             // Both UDP and TCP failed - mark as suspect
             // Don't mark nodes as suspect if we're leaving
@@ -237,6 +306,11 @@ public partial class Memberlist
             var stateHandler = new StateHandlers(this, _logger);
             stateHandler.HandleSuspectNode(suspect);
         }
+        catch (OperationCanceledException) when (_shutdownCts.IsCancellationRequested)
+        {
+            // Shutting down: abandon the probe without touching awareness
+            awarenessDelta = 0;
+        }
         catch (Exception ex)
         {
             _logger?.LogWarning(ex, "Error probing node: {Node}", node.Name);
@@ -244,6 +318,47 @@ public partial class Memberlist
         finally
         {
             AckHandlers.TryRemove(seqNo, out _);
+            Awareness.ApplyDelta(awarenessDelta);
+        }
+    }
+
+    /// <summary>
+    /// Waits for the probe ack task to complete, for at most <paramref name="timeout"/>.
+    /// Returns the ack, or null when the timeout elapsed or the handler timed out without an ack.
+    /// Throws <see cref="OperationCanceledException"/> when the memberlist is shutting down.
+    /// </summary>
+    private async Task<(byte[] Payload, DateTimeOffset Timestamp)?> WaitForAckAsync(
+        Task<(byte[] Payload, DateTimeOffset Timestamp)?> ackTask, TimeSpan timeout)
+    {
+        try
+        {
+            return await ackTask.WaitAsync(timeout, _shutdownCts.Token);
+        }
+        catch (TimeoutException)
+        {
+            return null;
+        }
+    }
+
+    private void OnProbeSucceeded(NodeState node)
+    {
+        _logger?.LogDebug("Probe successful for node: {Node}", node.Name);
+
+        // Cancel any suspicion timer since the node responded successfully
+        ClearSuspicionTimer(node);
+    }
+
+    private void ClearSuspicionTimer(NodeState node)
+    {
+        if (!NodeTimers.TryRemove(node.Name, out var timerObj) || timerObj is not Suspicion suspicion) return;
+
+        try
+        {
+            suspicion.Dispose();
+        }
+        catch (ObjectDisposedException)
+        {
+            // Timer already disposed, safe to ignore
         }
     }
 
@@ -285,7 +400,7 @@ public partial class Memberlist
         // Log each gossip target for accurate visualization
         foreach (var node in kNodes)
         {
-            _logger?.LogInformation("[GOSSIP] Gossiping to {Node}", node.Name);
+            _logger?.LogDebug("[GOSSIP] Gossiping to {Node}", node.Name);
         }
 
         // CRITICAL: Get broadcasts ONCE per gossip interval, not per node!
@@ -592,25 +707,11 @@ public partial class Memberlist
         try
         {
             // Read remote state from the payload stream 
-            var (remoteNodes, userState) = await ReadRemoteStateAsync(payloadStream, _shutdownCts.Token);
-            _logger?.LogDebug("Received {Count} nodes from remote", remoteNodes.Count);
+            var (join, remoteNodes, userState) = await ReadRemoteStateAsync(payloadStream, _shutdownCts.Token);
+            _logger?.LogDebug("Received {Count} nodes from remote (join: {Join})", remoteNodes.Count, join);
 
-            // Merge remote state
-            var stateHandler = new StateHandlers(this, _logger);
-            stateHandler.MergeRemoteState(remoteNodes);
-
-            // Handle user state through delegate if needed
-            if (userState is { Length: > 0 } && Config.Delegate != null)
-            {
-                try
-                {
-                    Config.Delegate.MergeRemoteState(userState, join: false);
-                }
-                catch (Exception ex)
-                {
-                    _logger?.LogWarning(ex, "Failed to merge remote user state");
-                }
-            }
+            // Merge remote state (the join flag comes from the peer's push/pull header)
+            MergeRemoteState(join, remoteNodes, userState);
 
             // Send our state back on the response stream
             await SendLocalStateAsync(responseStream, join: false, Config.Label, _shutdownCts.Token);
@@ -942,16 +1043,51 @@ public partial class Memberlist
         // Send and receive state
         var (remoteNodes, userState) = await SendAndReceiveStateAsync(addr, join, cancellationToken);
 
-        // Merge remote state into local state
+        MergeRemoteState(join, remoteNodes, userState);
+    }
+
+    /// <summary>
+    /// Merges the node states and delegate state received from a peer.
+    /// For joins the merge delegate may veto the merge before anything is applied.
+    /// Mirrors Go's mergeRemoteState.
+    /// </summary>
+    private void MergeRemoteState(bool join, List<PushNodeState> remoteNodes, byte[]? userState)
+    {
+        if (join && Config.Merge != null)
+        {
+            var peers = remoteNodes.Select(n => new Node
+            {
+                Name = n.Name,
+                Addr = new System.Net.IPAddress(n.Addr),
+                Port = n.Port,
+                Meta = n.Meta,
+                State = n.State,
+                PMin = n.Vsn.Length > 0 ? n.Vsn[0] : (byte)0,
+                PMax = n.Vsn.Length > 1 ? n.Vsn[1] : (byte)0,
+                PCur = n.Vsn.Length > 2 ? n.Vsn[2] : (byte)0,
+                DMin = n.Vsn.Length > 3 ? n.Vsn[3] : (byte)0,
+                DMax = n.Vsn.Length > 4 ? n.Vsn[4] : (byte)0,
+                DCur = n.Vsn.Length > 5 ? n.Vsn[5] : (byte)0
+            }).ToList();
+
+            var mergeError = Config.Merge.NotifyMerge(peers);
+            if (mergeError != null)
+            {
+                throw new InvalidOperationException($"Merge canceled by delegate: {mergeError}");
+            }
+        }
+
+        // Merge remote node states into local state
         var stateHandler = new StateHandlers(this, _logger);
         stateHandler.MergeRemoteState(remoteNodes);
 
-        // Handle user state through delegate if present
+        // Handle user state through the delegate if present. The join flag matters here:
+        // Serf uses it to suppress the replay of old user events when joining with ignoreOld.
         if (userState is { Length: > 0 } && Config.Delegate != null)
         {
             try
             {
-                Config.Delegate.MergeRemoteState(userState, join: false);
+                Config.Delegate.MergeRemoteState(userState, join);
             }
             catch (Exception ex)
             {
@@ -1102,7 +1238,7 @@ public partial class Memberlist
             }
 
             // Read remote state from the response stream
-            var (remoteNodes, userState) = await ReadRemoteStateAsync(responseStream, cancellationToken);
+            var (_, remoteNodes, userState) = await ReadRemoteStateAsync(responseStream, cancellationToken);
             return (remoteNodes, userState);
         }
         catch (Exception ex)
@@ -1211,7 +1347,7 @@ public partial class Memberlist
     /// Reads remote state from a TCP stream connection.
     /// Stream should already be positioned after the message type byte.
     /// </summary>
-    private static async Task<(List<PushNodeState> RemoteNodes, byte[]? UserState)> ReadRemoteStateAsync(
+    private static async Task<(bool Join, List<PushNodeState> RemoteNodes, byte[]? UserState)> ReadRemoteStateAsync(
         Stream conn,
         CancellationToken cancellationToken)
     {
@@ -1230,12 +1366,19 @@ public partial class Memberlist
 
         // Read user state if present
         byte[]? userState = null;
-        if (header.UserStateLen <= 0) return (remoteNodes, userState);
+        if (header.UserStateLen <= 0) return (header.Join, remoteNodes, userState);
         userState = new byte[header.UserStateLen];
 
-        var read = await conn.ReadAsync(userState, cancellationToken);
-        return read != header.UserStateLen
-            ? throw new IOException($"Expected {header.UserStateLen} bytes of user state but got {read}")
-            : (remoteNodes, userState);
+        var totalRead = 0;
+        while (totalRead < header.UserStateLen)
+        {
+            var read = await conn.ReadAsync(userState.AsMemory(totalRead, header.UserStateLen - totalRead), cancellationToken);
+            if (read == 0)
+                throw new IOException($"Expected {header.UserStateLen} bytes of user state but got {totalRead}");
+
+            totalRead += read;
+        }
+
+        return (header.Join, remoteNodes, userState);
     }
 }

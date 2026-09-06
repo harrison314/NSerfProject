@@ -97,27 +97,23 @@ public class SerfSnapshotTest : IDisposable
         // Join nodes
         var joinAddr = $"127.0.0.1:{s2Port}";
         await s1.JoinAsync(new[] { joinAddr }, ignoreOld: false);
-        await Task.Delay(500);
+        await TestHelpers.WaitUntilNumNodesAsync(2, TimeSpan.FromSeconds(10), s1, s2);
 
         s1.NumMembers().Should().Be(2, "should have 2 members after join");
         s2.NumMembers().Should().Be(2, "should have 2 members after join");
 
         // Fire a user event to test snapshot persistence
         await s1.UserEventAsync("test-event", System.Text.Encoding.UTF8.GetBytes("test"), coalesce: false);
-        await Task.Delay(200);
-        
-        // Wait longer than snapshot flush interval (500ms) before checking file
-        await Task.Delay(1200);
-        
-        // Extra small buffer to reduce flakiness
-        await Task.Delay(300);
+
+        // Wait for the snapshotter (500ms flush interval) to persist node1 as alive before killing s2
+        await WaitForSnapshotContentAsync(snapshotPath, "alive: node1", TimeSpan.FromSeconds(5));
         
         // Act - Simulate s2 failure by shutting it down
         await s2.ShutdownAsync();
         await s2.DisposeAsync();
         
-        // Wait for failure detection (slightly increased)
-        await Task.Delay(2000);
+        // Wait for failure detection
+        await TestHelpers.WaitForMemberStatusAsync(s1, "node2", MemberStatus.Failed, TimeSpan.FromSeconds(10));
 
         // Verify s2 is marked as failed
         var s1Members = s1.Members();
@@ -127,15 +123,15 @@ public class SerfSnapshotTest : IDisposable
 
         // Remove failed node
         await s1.RemoveFailedNodeAsync("node2");
-        await Task.Delay(200);
+        await TestHelpers.WaitForMemberStatusAsync(s1, "node2", MemberStatus.Left, TimeSpan.FromSeconds(5));
 
         // Verify s2 is marked as left
         var s1MembersAfterRemoval = s1.Members();
         var s2MemberAfterRemoval = s1MembersAfterRemoval.FirstOrDefault(m => m.Name == "node2");
         s2MemberAfterRemoval!.Status.Should().Be(MemberStatus.Left, "s2 should be marked as left after removal");
 
-        // DEBUG: Read snapshot file to verify contents
-        await Task.Delay(2000); // Ensure file is fully written
+        // DEBUG: Read snapshot file to verify contents (s2 is shut down, so the file is final)
+        await WaitForSnapshotContentAsync(snapshotPath, "alive: node1", TimeSpan.FromSeconds(5));
         var snapshotContents = await ReadSnapshotWithRetryAsync(snapshotPath);
         snapshotContents.Should().Contain("alive: node1", "snapshot should contain node1 as alive");
         snapshotContents.Should().NotContain("leave", "snapshot should not contain leave marker after shutdown (only LeaveAsync should write it)");
@@ -161,33 +157,16 @@ public class SerfSnapshotTest : IDisposable
         
         // Wait for auto-rejoin from BOTH perspectives
         // s2 auto-rejoins from snapshot, then s1 receives NotifyJoin callback
-        var rejoined = false;
-        var s2HasNode1 = false;
-        var s1HasNode2 = false;
-
-        for (int i = 0; i < 15; i++)
+        static bool SeesAlive(NSerf.Serf.Serf serf, string name)
         {
-            await Task.Delay(1000);
-
-            // Check if s2 has rejoined node1 (from s2's perspective)
-            var s2MembersPoll = s2Restarted.Members();
-            s2HasNode1 = s2MembersPoll.Length == 2 && 
-                         s2MembersPoll.Any(m => m.Name == "node1" && m.Status == MemberStatus.Alive);
-
-            // Check if s1 sees node2 as alive (from s1's perspective)
-            var s1MembersPoll = s1.Members();
-            s1HasNode2 = s1MembersPoll.Length == 2 && 
-                         s1MembersPoll.Any(m => m.Name == "node2" && m.Status == MemberStatus.Alive);
-
-            if (s2HasNode1 && s1HasNode2)
-            {
-                rejoined = true;
-                break;
-            }
+            var members = serf.Members();
+            return members.Length == 2 && members.Any(m => m.Name == name && m.Status == MemberStatus.Alive);
         }
 
-        // Assert - Verify auto-rejoin worked
-        rejoined.Should().BeTrue("s2 should auto-rejoin from snapshot. s2HasNode1={0}, s1HasNode2={1}", s2HasNode1, s1HasNode2);
+        await TestHelpers.WaitForConditionAsync(
+            () => SeesAlive(s2Restarted, "node1") && SeesAlive(s1, "node2"),
+            TimeSpan.FromSeconds(15),
+            () => $"s2 should auto-rejoin from snapshot. s2HasNode1={SeesAlive(s2Restarted, "node1")}, s1HasNode2={SeesAlive(s1, "node2")}");
         
         var s1MembersAfterRejoin = s1.Members();
         var s2MemberAfterRejoin = s1MembersAfterRejoin.FirstOrDefault(m => m.Name == "node2");
@@ -251,7 +230,7 @@ public class SerfSnapshotTest : IDisposable
         // Join nodes
         var joinAddr = $"127.0.0.1:{s2Port}";
         await s1.JoinAsync(new[] { joinAddr }, ignoreOld: false);
-        await Task.Delay(500);
+        await TestHelpers.WaitUntilNumNodesAsync(2, TimeSpan.FromSeconds(10), s1, s2);
 
         s1.NumMembers().Should().Be(2);
         s2.NumMembers().Should().Be(2);
@@ -261,25 +240,8 @@ public class SerfSnapshotTest : IDisposable
         await s2.ShutdownAsync();
         s2.Dispose();
 
-        // Wait for leave to propagate
-        await Task.Delay(500);
-
         // Verify s2 is marked as left
-        var leftDetected = false;
-        for (int i = 0; i < 50; i++)
-        {
-            await Task.Delay(100);
-            
-            var s1Members = s1.Members();
-            var s2Member = s1Members.FirstOrDefault(m => m.Name == "node2");
-            if (s2Member?.Status == MemberStatus.Left)
-            {
-                leftDetected = true;
-                break;
-            }
-        }
-
-        leftDetected.Should().BeTrue("s2 should be marked as left");
+        await TestHelpers.WaitForMemberStatusAsync(s1, "node2", MemberStatus.Left, TimeSpan.FromSeconds(10));
 
         // Act - Restart s2 from snapshot (which contains leave marker)
         config2 = new Config
@@ -354,20 +316,21 @@ public class SerfSnapshotTest : IDisposable
 
         // Join
         await s1.JoinAsync(new[] { $"127.0.0.1:{s2Port}" }, ignoreOld: false);
-        await Task.Delay(500);
+        await TestHelpers.WaitUntilNumNodesAsync(2, TimeSpan.FromSeconds(10), s1, s2);
 
         // Leave and shutdown
         await s2.LeaveAsync();
         await s2.ShutdownAsync();
         s2.Dispose();
-        await Task.Delay(500);
+        await TestHelpers.WaitForMemberStatusAsync(s1, "node2", MemberStatus.Left, TimeSpan.FromSeconds(10));
 
         // Restart with RejoinAfterLeave=true
         config2.MemberlistConfig.BindPort = s2Port;
         using var s2Restarted = await NSerf.Serf.Serf.CreateAsync(config2);
 
         // Should auto-rejoin even after leave
-        await Task.Delay(1000);
+        await TestHelpers.WaitForConditionAsync(() => s2Restarted.NumMembers() > 1, TimeSpan.FromSeconds(5),
+            "s2 should have auto-rejoined node1 from its snapshot after restart");
 
         // With RejoinAfterLeave, the snapshot should still have node1's address
         // so s2 should attempt to rejoin
@@ -375,6 +338,30 @@ public class SerfSnapshotTest : IDisposable
 
         await s1.ShutdownAsync();
         await s2Restarted.ShutdownAsync();
+    }
+
+    /// <summary>
+    /// Polls the snapshot file until it contains <paramref name="expected"/> (the snapshotter flushes
+    /// on a 500ms timer, so the file lags the in-memory state).
+    /// </summary>
+    private static Task WaitForSnapshotContentAsync(string path, string expected, TimeSpan timeout)
+    {
+        return TestHelpers.WaitForConditionAsync(
+            () =>
+            {
+                try
+                {
+                    using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                    using var reader = new StreamReader(fs);
+                    return reader.ReadToEnd().Contains(expected);
+                }
+                catch (IOException)
+                {
+                    return false;
+                }
+            },
+            timeout,
+            () => $"snapshot {path} did not contain '{expected}' within {timeout}");
     }
 
     private static async Task<string> ReadSnapshotWithRetryAsync(string path, int maxRetries = 10)

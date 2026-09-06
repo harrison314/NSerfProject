@@ -4,17 +4,10 @@
 using System.CommandLine;
 using NSerf.CLI.Commands;
 
-var cts = new CancellationTokenSource();
-Console.CancelKeyPress += (_, e) =>
-{
-    e.Cancel = true;
-    cts.Cancel();
-};
-
 var rootCommand = new RootCommand("NSerf - Service orchestration and discovery tool")
 {
     // Add commands
-    AgentCommand.Create(cts.Token), // Agent command must be first
+    AgentCommand.Create(), // Agent command must be first
     MembersCommand.Create(),
     JoinCommand.Create(),
     LeaveCommand.Create(),
@@ -32,4 +25,9 @@ var rootCommand = new RootCommand("NSerf - Service orchestration and discovery t
     ConfigSecretsCommand.Create()
 };
 
-return await rootCommand.Parse(args).InvokeAsync();
+// The agent command owns signal handling (SIGINT/SIGTERM/SIGHUP with Go's leave semantics), so
+// System.CommandLine's Ctrl+C termination timeout must not cut a graceful leave short.
+return await rootCommand.Parse(args).InvokeAsync(new InvocationConfiguration
+{
+    ProcessTerminationTimeout = null
+});

@@ -21,7 +21,7 @@ namespace NSerf.Serf.Managers;
 public class EventManager(
     ChannelWriter<IEvent>? eventCh,
     int eventBufferSize,
-    ILogger? logger = null)
+    ILogger? logger = null) : IDisposable
 {
 
     // Event buffer for deduplication (circular buffer indexed by LTime % bufferSize)
@@ -88,6 +88,18 @@ public class EventManager(
                 // Create a new collection for this LTime
                 seen = new UserEventCollection { LTime = userEvent.LTime };
                 _eventBuffer[userEvent.LTime] = seen;
+
+                // Bound the buffer like Go's fixed-size ring (indexed by LTime % EventBuffer).
+                // Anything older than the window can no longer be de-duplicated anyway and must
+                // not be shipped in every push/pull.
+                if (_eventBuffer.Count > eventBufferSize && curTime > bufferSize)
+                {
+                    var cutoff = curTime - bufferSize;
+                    foreach (var stale in _eventBuffer.Keys.Where(k => k < cutoff).ToList())
+                    {
+                        _eventBuffer.Remove(stale);
+                    }
+                }
             }
 
             // Add to recent events

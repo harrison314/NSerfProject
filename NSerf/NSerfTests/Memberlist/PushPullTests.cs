@@ -11,6 +11,7 @@ using NSerf.Memberlist.Delegates;
 using NSerf.Memberlist.Messages;
 using NSerf.Memberlist.Security;
 using NSerf.Memberlist.State;
+using NSerfTests.Serf;
 using Xunit;
 
 namespace NSerfTests.Memberlist;
@@ -365,7 +366,8 @@ public class PushPullTests : IDisposable
         result.RemoteNodes.Should().NotBeEmpty("should receive at least one remote node");
 
         // Wait for events to propagate
-        await Task.Delay(200);
+        await TestHelpers.WaitForConditionAsync(() => !events.IsEmpty, TimeSpan.FromSeconds(5),
+            "m2 did not receive any node events from push/pull");
 
         // m2 should have received node events from m1's state
         events.Should().NotBeEmpty("m2 should have received node events from push/pull");
@@ -391,7 +393,8 @@ public class PushPullTests : IDisposable
         numJoined.Should().BeGreaterThan(0, "should join at least one node");
 
         // Wait for state to propagate
-        await Task.Delay(500);
+        await TestHelpers.WaitForConditionAsync(() => m1.NumMembers() >= 2 && m2.NumMembers() >= 2,
+            TimeSpan.FromSeconds(5), () => $"cluster did not converge: m1={m1.NumMembers()}, m2={m2.NumMembers()}");
 
         // Both nodes should see each other
         m1.NumMembers().Should().BeGreaterOrEqualTo(2, "m1 should see both nodes");
@@ -441,7 +444,13 @@ public class PushPullTests : IDisposable
         error.Should().BeNull("encrypted join should succeed with matching keys");
         numJoined.Should().Be(1, "should successfully join 1 node");
 
-        await Task.Delay(1000); // Allow more time for encrypted state to propagate
+        // Wait for the encrypted state exchange to make both nodes visible to each other
+        await TestHelpers.WaitForConditionAsync(
+            () => m1.Members().Any(m => m.Name == "secure-node2") && m2.Members().Any(m => m.Name == "secure-node1"),
+            TimeSpan.FromSeconds(5),
+            () => "encrypted push-pull did not exchange state: " +
+            $"m1 sees [{string.Join(", ", m1.Members().Select(m => m.Name))}], " +
+            $"m2 sees [{string.Join(", ", m2.Members().Select(m => m.Name))}]");
 
         // Verify both nodes see each other
         var m1Members = m1.Members();
@@ -450,26 +459,8 @@ public class PushPullTests : IDisposable
         Console.WriteLine($"[TEST] m1 sees {m1Members.Count} members: {string.Join(", ", m1Members.Select(m => m.Name))}");
         Console.WriteLine($"[TEST] m2 sees {m2Members.Count} members: {string.Join(", ", m2Members.Select(m => m.Name))}");
 
-        // With encryption enabled, verify basic functionality
-        // Note: Encrypted gossip and state exchange may need additional setup
-        m1Members.Should().NotBeEmpty("m1 should see at least itself");
-        m2Members.Should().NotBeEmpty("m2 should see at least itself");
-
-        // Check if nodes can see each other (best case)
-        var m1SeesM2 = m1Members.Any(m => m.Name == "secure-node2");
-        var m2SeesM1 = m2Members.Any(m => m.Name == "secure-node1");
-
-        if (m1SeesM2 && m2SeesM1)
-        {
-            Console.WriteLine("[TEST] ✓ Encrypted push-pull successfully exchanged state");
-            m1Members.Should().HaveCount(2, "both nodes should see each other");
-            m2Members.Should().HaveCount(2, "both nodes should see each other");
-        }
-        else
-        {
-            Console.WriteLine($"[TEST] Encryption enabled but state exchange incomplete: m1SeesM2={m1SeesM2}, m2SeesM1={m2SeesM1}");
-            Console.WriteLine("[TEST] This may indicate encrypted push-pull needs additional configuration");
-        }
+        m1Members.Should().HaveCount(2, "both nodes should see each other");
+        m2Members.Should().HaveCount(2, "both nodes should see each other");
     }
 
     /// <summary>
@@ -549,7 +540,8 @@ public class PushPullTests : IDisposable
         error.Should().BeNull("join should succeed even with empty state");
         numJoined.Should().Be(1, "should join successfully");
 
-        await Task.Delay(500);
+        await TestHelpers.WaitForConditionAsync(() => m1.Members().Count == 2 && m2.Members().Count == 2,
+            TimeSpan.FromSeconds(5), () => $"cluster did not converge: m1={m1.Members().Count}, m2={m2.Members().Count}");
 
         // Both nodes should see each other despite starting with empty state
         var m1Members = m1.Members();
@@ -613,7 +605,8 @@ public class PushPullTests : IDisposable
         error.Should().BeNull("join should succeed with large state");
         numJoined.Should().Be(1);
 
-        await Task.Delay(1000); // Give time for state to propagate
+        await TestHelpers.WaitForConditionAsync(() => m2.Members().Count >= 10, TimeSpan.FromSeconds(5),
+            () => $"m2 only received {m2.Members().Count} nodes from the large state");
 
         var m2Members = m2.Members();
         Console.WriteLine($"[TEST] m2 received {m2Members.Count} nodes from large state");
@@ -683,7 +676,8 @@ public class PushPullTests : IDisposable
         {
             numJoined.Should().Be(1, "compressed join should succeed");
 
-            await Task.Delay(800);
+            await TestHelpers.WaitForConditionAsync(() => m2.Members().Count > 2, TimeSpan.FromSeconds(5),
+                () => $"m2 only received {m2.Members().Count} nodes via compressed push-pull");
 
             var m2Members = m2.Members();
             Console.WriteLine($"[TEST] Compression enabled: m2 received {m2Members.Count} nodes");
@@ -839,13 +833,15 @@ public class PushPullTests : IDisposable
         {
             numJoined.Should().Be(1, "join with encryption+compression should succeed");
 
-            await Task.Delay(1000);
+            await TestHelpers.WaitForConditionAsync(() => m2.Members().Any(m => m.Name == "secure-compressed-node1"),
+                TimeSpan.FromSeconds(5), "m2 never received m1's state via encrypted+compressed push-pull");
 
             var m2Members = m2.Members();
             Console.WriteLine($"[TEST] Encryption+Compression: m2 sees {m2Members.Count} members");
 
-            // Should at least see itself
+            // Should see itself and the node it joined
             m2Members.Should().NotBeEmpty("should receive state even with encryption and compression");
+            m2Members.Should().Contain(m => m.Name == "secure-compressed-node1", "m2 should have received m1's state");
         }
         else
         {

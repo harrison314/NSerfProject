@@ -61,22 +61,44 @@ public class AgentOperationsTests
     [Fact]
     public async Task Agent_UserEvent_Broadcasts()
     {
-        var config = new AgentConfig
-        {
-            NodeName = "test-event",
-            BindAddr = "127.0.0.1:0"
-        };
+        // Two agents: the event sent by one must be delivered to the other's event handlers
+        var sender = new SerfAgent(new AgentConfig { NodeName = "test-event", BindAddr = "127.0.0.1:0" });
+        var receiver = new SerfAgent(new AgentConfig { NodeName = "test-event-receiver", BindAddr = "127.0.0.1:0" });
+        await sender.StartAsync();
+        await receiver.StartAsync();
 
-        var agent = new SerfAgent(config);
-        await agent.StartAsync();
+        var received = new TestEventHandler();
+        receiver.RegisterEventHandler(received);
+
+        var senderMember = sender.Serf!.LocalMember();
+        var joined = await receiver.Serf!.JoinAsync(new[] { $"{senderMember.Addr}:{senderMember.Port}" }, ignoreOld: true);
+        Assert.Equal(1, joined);
+        await NSerfTests.Serf.TestHelpers.WaitUntilNumNodesAsync(2, TimeSpan.FromSeconds(10), sender.Serf, receiver.Serf);
 
         var payload = System.Text.Encoding.UTF8.GetBytes("test payload");
-        await agent.Serf!.UserEventAsync("test-event", payload, coalesce: false);
+        await sender.Serf.UserEventAsync("test-event", payload, coalesce: false);
 
-        // Event broadcasted - no exception
-        await Task.Delay(100);
+        // The receiving agent's handlers see the user event
+        await NSerfTests.Serf.TestHelpers.WaitForConditionAsync(
+            () =>
+            {
+                lock (received.ReceivedEvents)
+                {
+                    return received.ReceivedEvents.OfType<NSerf.Serf.Events.UserEvent>().Any(e => e.Name == "test-event");
+                }
+            },
+            TimeSpan.FromSeconds(10),
+            () => $"the receiver never got the user event; it received {received.Count} event(s)");
 
-        await agent.DisposeAsync();
+        NSerf.Serf.Events.UserEvent userEvent;
+        lock (received.ReceivedEvents)
+        {
+            userEvent = received.ReceivedEvents.OfType<NSerf.Serf.Events.UserEvent>().First(e => e.Name == "test-event");
+        }
+        Assert.Equal(payload, userEvent.Payload);
+
+        await receiver.DisposeAsync();
+        await sender.DisposeAsync();
     }
 
     [Fact]

@@ -402,6 +402,7 @@ FodyWeavers.xsd
 NSerf/NSerf/.sonarqube/
 .sonarqube/
 NSerf/qodana.yaml
-#refrence libs
-memberlist/
-serf/
+#reference libs (Go checkouts at the repository root only; on case-insensitive
+#file systems an unanchored 'serf/' would also hide new files under NSerf/NSerf/Serf)
+/memberlist/
+/serf/

@@ -15,7 +15,7 @@ on:
         default: '0.1.6-beta'
 
 env:
-  DOTNET_VERSION: '8.0.x'
+  DOTNET_VERSION: '10.0.x'
   SOLUTION_FILE: 'NSerf/NSerf.sln'
   CLI_PROJECT: 'NSerf/NSerf.CLI/NSerf.CLI.csproj'
 
@@ -51,7 +51,6 @@ jobs:
       
     - name: Run tests
       run: dotnet test ${{ env.SOLUTION_FILE }} --no-build --configuration Release --verbosity normal --collect:"XPlat Code Coverage"
-      continue-on-error: true
       
     - name: Publish NSerf CLI (Self-contained)
       run: |
@@ -164,7 +163,7 @@ jobs:
         Choose the appropriate package for your platform:
         
         - **Windows x64 (Self-contained)**: Includes .NET runtime, no installation required
-        - **Windows x64 (Framework-dependent)**: Requires .NET 8.0 runtime to be installed
+        - **Windows x64 (Framework-dependent)**: Requires .NET 10.0 runtime to be installed
         - **Linux x64 (Self-contained)**: Includes .NET runtime, no installation required  
         - **macOS x64 (Self-contained)**: Includes .NET runtime, no installation required
         

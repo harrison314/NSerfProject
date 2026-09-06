@@ -41,7 +41,8 @@ public class MemberCommandExtendedTests : IAsyncLifetime
 
         var addr = $"{agent2.Agent!.Serf!.Members()[0].Addr}:{agent2.Agent.Serf.Members()[0].Port}";
         await _fixture!.Agent!.Serf!.JoinAsync(new[] { addr }, ignoreOld: false);
-        await Task.Delay(2000);
+        Assert.True(await NSerf.CLI.Tests.Helpers.TestHelper.WaitForConditionAsync(() => _fixture.Agent.Serf.Members().Length == 2, TimeSpan.FromSeconds(5)),
+            "agent never saw both members after join");
 
         var members = _fixture.Agent.Serf.Members();
         Assert.Equal(2, members.Length);
@@ -85,10 +86,13 @@ public class MemberCommandExtendedTests : IAsyncLifetime
 
         var addr = $"{agent2.Agent!.Serf!.Members()[0].Addr}:{agent2.Agent.Serf.Members()[0].Port}";
         await _fixture!.Agent!.Serf!.JoinAsync(new[] { addr }, ignoreOld: false);
-        await Task.Delay(2000);
+        Assert.True(await NSerf.CLI.Tests.Helpers.TestHelper.WaitForConditionAsync(() => _fixture.Agent.Serf.Members().Length == 2, TimeSpan.FromSeconds(5)),
+            "agent never saw both members after join");
 
         await agent2.Agent.Serf.LeaveAsync();
-        await Task.Delay(2000);
+        Assert.True(await NSerf.CLI.Tests.Helpers.TestHelper.WaitForConditionAsync(
+            () => _fixture.Agent.Serf.Members().FirstOrDefault(m => m.Name == agent2.Agent.NodeName)?.Status == Serf.MemberStatus.Left,
+            TimeSpan.FromSeconds(5)), "agent2 never showed as Left after LeaveAsync");
 
         var members = _fixture.Agent.Serf.Members();
         var leftMember = members.FirstOrDefault(m => m.Name == agent2.Agent.NodeName);
@@ -104,11 +108,14 @@ public class MemberCommandExtendedTests : IAsyncLifetime
 
         var addr = $"{agent2.Agent!.Serf!.Members()[0].Addr}:{agent2.Agent.Serf.Members()[0].Port}";
         await _fixture!.Agent!.Serf!.JoinAsync(new[] { addr }, ignoreOld: false);
-        await Task.Delay(2000);
+        Assert.True(await NSerf.CLI.Tests.Helpers.TestHelper.WaitForConditionAsync(() => _fixture.Agent.Serf.Members().Length == 2, TimeSpan.FromSeconds(5)),
+            "agent never saw both members after join");
 
         // Graceful shutdown broadcasts leave message
         await agent2.Agent.ShutdownAsync();
-        await Task.Delay(5000); // Reduced wait time since leave is now broadcasted correctly
+        Assert.True(await NSerf.CLI.Tests.Helpers.TestHelper.WaitForConditionAsync(
+            () => _fixture.Agent.Serf.Members().FirstOrDefault(m => m.Name == agent2.Agent.NodeName)?.Status == Serf.MemberStatus.Left,
+            TimeSpan.FromSeconds(10)), "agent2 never showed as Left after graceful shutdown");
 
         var members = _fixture.Agent.Serf.Members();
         var leftMember = members.FirstOrDefault(m => m.Name == agent2.Agent.NodeName);

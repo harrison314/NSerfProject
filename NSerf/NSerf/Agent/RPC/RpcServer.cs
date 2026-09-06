@@ -34,8 +34,12 @@ public class RpcServer(SerfAgent agent, string bindAddr, string? authKey = null)
         var endpoint = (IPEndPoint)_listener.LocalEndpoint;
         Address = $"{endpoint.Address}:{endpoint.Port}";
 
-        _cts = new CancellationTokenSource();
-        _acceptTask = Task.Run(() => AcceptClientsAsync(_cts.Token), cancellationToken);
+        // Capture the token now: the lambda runs later on the thread pool, and a fast DisposeAsync can
+        // have swapped _cts to null by then (NullReferenceException on start-then-stop).
+        var cts = new CancellationTokenSource();
+        var acceptToken = cts.Token;
+        _cts = cts;
+        _acceptTask = Task.Run(() => AcceptClientsAsync(acceptToken), cancellationToken);
 
         return Task.CompletedTask;
     }

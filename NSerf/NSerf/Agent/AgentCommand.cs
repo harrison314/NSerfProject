@@ -6,28 +6,37 @@ using Microsoft.Extensions.Logging;
 namespace NSerf.Agent;
 
 /// <summary>
-/// Main agent command with full lifecycle management.
-/// Maps to: Go's command.go
+/// Main agent command with full lifecycle management: the single runner path used by the CLI and by
+/// hosts that embed the agent. It creates a <see cref="SerfAgent"/> (which performs the start-join,
+/// runs the retry-join loop and starts the RPC server), starts mDNS discovery, streams the agent's
+/// log lines to the console through the level filter, and turns OS signals into Go's shutdown
+/// semantics. Maps to: Go's cmd/serf/command/agent/command.go
 /// </summary>
 public class AgentCommand : IAsyncDisposable
 {
     private readonly AgentConfig _config;
     private readonly ILogger? _logger;
     private readonly SignalHandler _signalHandler = new();
-    private readonly CancellationTokenSource _shutdownCts = new();
-    private readonly TaskCompletionSource<int> _exitCodeTcs = new();
+    private readonly TaskCompletionSource<int> _exitCodeTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly object _shutdownLock = new();
+    private readonly object _stopLock = new();
 
     private SerfAgent? _agent;
-    private RPC.RpcServer? _rpcServer;
     private AgentMdns? _mdns;
-    private Task? _retryJoinTask;
     private GatedWriter? _gatedWriter;
     private LogWriter? _logWriter;
+    private TextWriter? _originalOut;
+    private TextWriter? _installedOut;
+    private ConsoleLogHandler? _consoleLogHandler;
+    private Task? _stopTask;
     private int _signalCount;
-    private readonly object _shutdownLock = new();
+    private bool _started;
+    private bool _disposed;
+    // Set by every forced exit: the agent is then shut down without a leave (Go: agent.Shutdown()),
+    // so the cluster detects the node as failed instead of seeing a graceful leave.
+    private volatile bool _skipLeave;
 
     private const int GracefulTimeoutSeconds = 3;
-    private static readonly TimeSpan MinInterval = TimeSpan.FromSeconds(1);
 
     public AgentCommand(AgentConfig config, ILogger? logger = null)
     {
@@ -38,151 +47,202 @@ public class AgentCommand : IAsyncDisposable
         _signalHandler.RegisterCallback(HandleSignal);
     }
 
+    /// <summary>
+    /// Invoked on SIGHUP with the running agent (Go: handleReload). The CLI uses it to re-read its
+    /// configuration file and call <see cref="SerfAgent.UpdateEventHandlers"/>. Exceptions are logged.
+    /// </summary>
+    public Func<SerfAgent, CancellationToken, Task>? ReloadHandler { get; set; }
+
+    /// <summary>
+    /// The agent created by <see cref="RunAsync"/>, or null before the runner has started.
+    /// </summary>
+    public SerfAgent? Agent => _agent;
+
+    /// <summary>
+    /// Delivers a signal to the runner as if the OS had raised it (same semantics as a real
+    /// SIGINT/SIGTERM/SIGHUP). Useful for hosts that own the shutdown decision.
+    /// </summary>
+    public void SendSignal(Signal signal) => _signalHandler.TriggerSignal(signal);
+
     public async Task<int> RunAsync(CancellationToken cancellationToken = default)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_started)
+            throw new InvalidOperationException("Agent command already started");
+        _started = true;
+
+        SetupLogOutput();
+
         try
         {
-            // Setup log writers
-            var consoleOutput = Console.Out;
-            _gatedWriter = new GatedWriter(consoleOutput);
-            _logWriter = new LogWriter(_gatedWriter, LogLevelExtensions.FromString(_config.LogLevel ?? "INFO"));
+            WriteStatus("==> Starting Serf agent...");
 
-            // Redirect console output through a log writer
-            Console.SetOut(_logWriter);
-
-            _logger?.LogInformation("[Agent] Starting Serf agent Node name: {NodeName} Bind addr: {BindAddr}", _config.NodeName, _config.BindAddr);
-
-
-            // Create and start an agent
+            // Create and start the agent: this performs the start-join, starts the retry-join loop
+            // and the RPC server (Go: setupAgent + startupJoin + retryJoin + startupRPC).
             _agent = new SerfAgent(_config, _logger);
+            _consoleLogHandler = new ConsoleLogHandler(_logWriter!);
+            _agent.LogWriter?.RegisterHandler(_consoleLogHandler);
+            _agent.RetryJoinExhausted += OnRetryJoinExhausted;
+
             await _agent.StartAsync(cancellationToken);
 
+            StartMdns();
+
+            WriteStatus("==> Serf agent running!");
+            WriteStatus($"         Node name: '{_config.NodeName}'");
+            WriteStatus($"         Bind addr: '{_config.BindAddr}'");
+            WriteStatus($"          RPC addr: '{_agent.RpcAddress ?? _config.RpcAddr ?? string.Empty}'");
+            WriteStatus($"         Encrypted: {!string.IsNullOrEmpty(_config.EncryptKey) || !string.IsNullOrEmpty(_config.KeyringFile)}");
+            WriteStatus($"          Snapshot: {!string.IsNullOrEmpty(_config.SnapshotPath)}");
+            WriteStatus($"           Profile: {_config.Profile}");
+            if (!string.IsNullOrEmpty(_config.Discover))
+            {
+                WriteStatus($"     mDNS cluster: '{_config.Discover}'");
+            }
+            WriteStatus(string.Empty);
+            WriteStatus("==> Log data will now stream in as it occurs:");
+            WriteStatus(string.Empty);
+
             // Release buffered logs now that startup succeeded
-            await _gatedWriter.FlushAsync(cancellationToken);
+            _gatedWriter!.Flush();
 
-            // Start an RPC server if configured
-            if (!string.IsNullOrEmpty(_config.RpcAddr))
-            {
-                _rpcServer = new RPC.RpcServer(_agent, _config.RpcAddr, _config.RpcAuthKey);
-                await _rpcServer.StartAsync(cancellationToken);
-                _logger?.LogInformation("[Agent] RPC server listening on {RPCAddr}", _config.RpcAddr);
-            }
-
-            // Start join if configured
-            if (_config.StartJoin.Length > 0 && _agent.Serf != null)
-            {
-                var joined = await _agent.Serf.JoinAsync(_config.StartJoin, !_config.ReplayOnJoin);
-                if (joined == 0)
-                {
-                    _logger?.LogWarning("[Agent] Failed to join any nodes from start_join");
-                }
-                else
-                {
-                    _logger?.LogInformation("[Agent] Joined {Count} nodes", joined);
-                }
-            }
-
-            // Start retry join in the background if configured
-            if (_config.RetryJoin.Length > 0)
-            {
-                _retryJoinTask = Task.Run(() => RetryJoinAsync(_shutdownCts.Token), _shutdownCts.Token);
-            }
-
-            // Start mDNS discovery if configured
-            if (!string.IsNullOrEmpty(_config.Discover) && _agent.Serf?.Memberlist != null)
-            {
-                var localNode = _agent.Serf.Memberlist.LocalNode;
-                var bindAddr = localNode.Addr;
-                var bindPort = localNode.Port;
-
-                // Get mDNS interface (use mdns-specific interface if set, otherwise fall back to main interface)
-                System.Net.NetworkInformation.NetworkInterface? mdnsInterface = null;
-                var interfaceName = _config.Mdns.Interface ?? _config.Interface;
-                if (!string.IsNullOrEmpty(interfaceName))
-                {
-                    mdnsInterface = System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces()
-                        .FirstOrDefault(i => i.Name.Equals(interfaceName, StringComparison.OrdinalIgnoreCase));
-                    
-                    if (mdnsInterface == null)
-                    {
-                        _logger?.LogWarning("[Agent] mDNS interface '{Interface}' not found, using default", interfaceName);
-                    }
-                }
-
-                _logger?.LogInformation("[Agent] Starting mDNS listener for cluster: {Cluster}", _config.Discover);
-                
-                _mdns = new AgentMdns(
-                    _agent,
-                    replay: _config.ReplayOnJoin,
-                    node: _config.NodeName,
-                    discover: _config.Discover,
-                    bind: bindAddr,
-                    port: bindPort,
-                    disableIPv4: _config.Mdns.DisableIPv4,
-                    disableIPv6: _config.Mdns.DisableIPv6,
-                    logger: _logger
-                );
-            }
-
-            _logger?.LogInformation("[Agent] Serf agent running!");
-
-            // Wait for a shutdown signal or agent shutdown
-            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _shutdownCts.Token);
-
+            // Wait for a signal-driven exit, retry-join exhaustion, or cancellation by the host
             try
             {
-                await _exitCodeTcs.Task.WaitAsync(linkedCts.Token);
+                return await _exitCodeTcs.Task.WaitAsync(cancellationToken);
             }
             catch (OperationCanceledException)
             {
-                // Normal cancellation
+                // Host cancellation: shut down gracefully below
+                return _exitCodeTcs.Task.IsCompletedSuccessfully ? _exitCodeTcs.Task.Result : 0;
             }
-
-            return _exitCodeTcs.Task.IsCompleted ? _exitCodeTcs.Task.Result : 0;
         }
         catch (Exception ex)
         {
             _logger?.LogError(ex, "[Agent] Failed to start agent");
+            WriteStatus($"Error starting agent: {ex.Message}", error: true);
             return 1;
         }
+        finally
+        {
+            // Go: defer agent.Shutdown()
+            await StopAgentAsync();
+            RestoreConsole();
+
+            // The runner no longer owns the process signals once it has returned
+            _signalHandler.Dispose();
+        }
+    }
+
+    private void SetupLogOutput()
+    {
+        // Logs are gated until startup succeeded, then released to the console at the configured level
+        _originalOut = Console.Out;
+        _gatedWriter = new GatedWriter(_originalOut);
+        var level = string.IsNullOrEmpty(_config.LogLevel) ? LogLevel.Info : LogLevelExtensions.FromString(_config.LogLevel);
+        _logWriter = new LogWriter(_gatedWriter, level);
+
+        // Route direct console writes through the level filter as well
+        Console.SetOut(_logWriter);
+        _installedOut = Console.Out;
+    }
+
+    private void RestoreConsole()
+    {
+        lock (_stopLock)
+        {
+            if (_originalOut == null) return;
+
+            // Only put the original writer back if ours is still installed (a host may have redirected since)
+            if (ReferenceEquals(Console.Out, _installedOut))
+            {
+                Console.SetOut(_originalOut);
+            }
+
+            _originalOut = null;
+            _installedOut = null;
+        }
+
+        _gatedWriter?.Flush();
+    }
+
+    private void StartMdns()
+    {
+        if (string.IsNullOrEmpty(_config.Discover) || _agent?.Serf?.Memberlist == null)
+            return;
+
+        var localNode = _agent.Serf.Memberlist.LocalNode;
+        var bindAddr = localNode.Addr;
+        var bindPort = localNode.Port;
+
+        // Get mDNS interface (use mdns-specific interface if set, otherwise fall back to main interface)
+        var interfaceName = _config.Mdns.Interface ?? _config.Interface;
+        if (!string.IsNullOrEmpty(interfaceName))
+        {
+            var mdnsInterface = System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces()
+                .FirstOrDefault(i => i.Name.Equals(interfaceName, StringComparison.OrdinalIgnoreCase));
+
+            if (mdnsInterface == null)
+            {
+                LogLine(LogLevel.Warn, $"mDNS interface '{interfaceName}' not found, using default");
+            }
+        }
+
+        LogLine(LogLevel.Info, $"Starting mDNS listener for cluster: {_config.Discover}");
+
+        _mdns = new AgentMdns(
+            _agent,
+            replay: _config.ReplayOnJoin,
+            node: _config.NodeName,
+            discover: _config.Discover,
+            bind: bindAddr,
+            port: bindPort,
+            disableIPv4: _config.Mdns.DisableIPv4,
+            disableIPv6: _config.Mdns.DisableIPv6,
+            logger: _logger);
+    }
+
+    private void OnRetryJoinExhausted(int attempts)
+    {
+        // Go: "[ERR] agent: maximum retry join attempts made, exiting" -> exit code 1, no leave
+        LogLine(LogLevel.Error, "maximum retry join attempts made, exiting");
+        ForceShutdown();
     }
 
     private void HandleSignal(Signal signal)
     {
         lock (_shutdownLock)
         {
-            _signalCount++;
+            WriteStatus($"Caught signal: {signal}");
 
-            _logger?.LogInformation("[Agent] Received signal: {Signal}", signal);
-
-            // SIGHUP triggers config reload
+            // SIGHUP triggers a config reload and does not count towards the shutdown signals
             if (signal == Signal.SIGHUP)
             {
-                _logger?.LogInformation("[Agent] Reloading configuration...");
                 _ = Task.Run(ReloadConfigAsync);
                 return;
             }
 
+            _signalCount++;
+
             // First signal: graceful shutdown (if configured)
             if (_signalCount == 1)
             {
-                bool shouldGraceful = signal == Signal.SIGINT && !_config.SkipLeaveOnInt || signal == Signal.SIGTERM && _config.LeaveOnTerm;
+                var graceful = signal == Signal.SIGINT && !_config.SkipLeaveOnInt || signal == Signal.SIGTERM && _config.LeaveOnTerm;
 
-                if (shouldGraceful)
+                if (graceful)
                 {
-                    _logger?.LogInformation("[Agent] Gracefully shutting down agent...");
+                    WriteStatus("Gracefully shutting down agent...");
                     _ = Task.Run(GracefulShutdownAsync);
                 }
                 else
                 {
-                    _logger?.LogInformation("[Agent] Forcing shutdown...");
                     ForceShutdown();
                 }
             }
             // Second signal: force shutdown
-            else if (_signalCount >= 2)
+            else
             {
-                _logger?.LogWarning("[Agent] Force shutdown due to second signal");
+                LogLine(LogLevel.Warn, "Force shutdown due to second signal");
                 ForceShutdown();
             }
         }
@@ -192,156 +252,179 @@ public class AgentCommand : IAsyncDisposable
     {
         try
         {
-            var timeout = TimeSpan.FromSeconds(GracefulTimeoutSeconds);
-            using var cts = new CancellationTokenSource(timeout);
-
-            if (_agent != null)
+            var serf = _agent?.Serf;
+            if (serf != null)
             {
-                if (_agent.Serf != null)
+                var leaveTask = serf.LeaveAsync();
+                var completed = await Task.WhenAny(leaveTask, Task.Delay(TimeSpan.FromSeconds(GracefulTimeoutSeconds)));
+                if (completed != leaveTask)
                 {
-                    await _agent.Serf.LeaveAsync();
+                    LogLine(LogLevel.Error, $"Timeout ({GracefulTimeoutSeconds}s) while waiting for graceful leave, forcing shutdown");
+
+                    // The abandoned leave may still fail later; observe it so it never surfaces as unobserved
+                    _ = leaveTask.ContinueWith(t => _ = t.Exception, CancellationToken.None,
+                        TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+                    ForceShutdown();
+                    return;
                 }
-                await _agent.ShutdownAsync();
+
+                await leaveTask;
             }
 
-            _exitCodeTcs.TrySetResult(0);
+            Complete(0);
         }
         catch (Exception ex)
         {
             _logger?.LogError(ex, "[Agent] Error during graceful shutdown");
+            LogLine(LogLevel.Error, $"Error while leaving: {ex.Message}");
             ForceShutdown();
         }
     }
 
     private void ForceShutdown()
     {
-        _shutdownCts.Cancel();
-        _exitCodeTcs.TrySetResult(1);
+        _skipLeave = true;
+        Complete(1);
     }
 
-    private async Task RetryJoinAsync(CancellationToken cancellationToken)
-    {
-        if (!IsAbleToRetry()) return;
+    private void Complete(int exitCode) => _exitCodeTcs.TrySetResult(exitCode);
 
-        var interval = GetRetryInterval();
-        var attempt = 0;
-
-        while (!cancellationToken.IsCancellationRequested)
-        {
-            attempt++;
-
-            try
-            {
-                if (_agent!.Serf != null && _config.RetryJoin != null)
-                {
-                    var joined = await _agent.Serf.JoinAsync(_config.RetryJoin, !_config.ReplayOnJoin);
-                    if (joined > 0)
-                    {
-                        _logger?.LogInformation("[Agent] Retry join succeeded, joined {Count} nodes", joined);
-                        return;
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger?.LogWarning(ex, "[Agent] Retry join attempt {Attempt} failed", attempt);
-            }
-
-            // Check max attempts
-            if (_config.RetryMaxAttempts > 0 && attempt >= _config.RetryMaxAttempts)
-            {
-                _logger?.LogError("[Agent] Max retry attempts ({Max}) reached, giving up", _config.RetryMaxAttempts);
-                ForceShutdown();
-                return;
-            }
-
-            try
-            {
-                await Task.Delay(interval, cancellationToken);
-            }
-            catch (OperationCanceledException)
-            {
-                return;
-            }
-        }
-    }
-
-    private bool IsAbleToRetry() =>
-        _agent is { Serf: not null } && _config.RetryJoin.Length > 0;
-
-    private TimeSpan GetRetryInterval() =>
-        _config.RetryInterval > MinInterval ? _config.RetryInterval : MinInterval;
-
-    private Task ReloadConfigAsync()
+    private async Task ReloadConfigAsync()
     {
         try
         {
-            _logger?.LogInformation("[Agent] Config reload triggered");
+            LogLine(LogLevel.Info, "Reloading configuration...");
 
-            // For now, only log level and event scripts can be reloaded
-            // Full implementation would reload from a config file
-
-            // Update log level
-            if (!string.IsNullOrEmpty(_config.LogLevel) && _logWriter != null)
+            var agent = _agent;
+            var handler = ReloadHandler;
+            if (agent != null && handler != null)
             {
-                var newLevel = LogLevelExtensions.FromString(_config.LogLevel);
-                // Create new log writer with updated level
-                var consoleOutput = Console.Out;
-                _logWriter = new LogWriter(consoleOutput, newLevel);
-                Console.SetOut(_logWriter);
-                _logger?.LogInformation("[Agent] Log level updated");
+                await handler(agent, CancellationToken.None);
             }
 
-            // Update event scripts (if ScriptEventHandler supports hot reload)
-            _logger?.LogInformation("[Agent] Config reload completed");
-            return Task.CompletedTask;
+            LogLine(LogLevel.Info, "Reload completed");
         }
         catch (Exception ex)
         {
             _logger?.LogError(ex, "[Agent] Failed to reload config");
-            return Task.CompletedTask;
+            LogLine(LogLevel.Error, $"Reload failed: {ex.Message}");
         }
     }
 
-    public async ValueTask DisposeAsync()
+    private Task StopAgentAsync()
     {
-        await _shutdownCts.CancelAsync();
-
-        // Wait for the retry join task to complete after cancellation
-        if (_retryJoinTask != null)
+        lock (_stopLock)
         {
-            try
-            {
-                await _retryJoinTask;
-            }
-            catch (OperationCanceledException)
-            {
-                // Expected when shutdown token is canceled
-            }
+            _stopTask ??= StopAgentCoreAsync();
+            return _stopTask;
         }
+    }
 
+    private async Task StopAgentCoreAsync()
+    {
         // Dispose mDNS first to stop discovery
         _mdns?.Dispose();
+        _mdns = null;
 
-        if (_rpcServer != null)
+        var agent = _agent;
+        if (agent == null) return;
+
+        agent.RetryJoinExhausted -= OnRetryJoinExhausted;
+        try
         {
-            await _rpcServer.DisposeAsync();
+            // A forced exit stops the agent without leaving (Go: agent.Shutdown()); every other exit
+            // (graceful signal, host cancellation) leaves the cluster first.
+            await agent.ShutdownAsync(leave: !_skipLeave);
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogError(ex, "[Agent] Error during shutdown");
+            LogLine(LogLevel.Error, $"Error during shutdown: {ex.Message}");
         }
 
-        if (_agent != null)
+        if (_consoleLogHandler != null)
         {
-            await _agent.DisposeAsync();
+            agent.LogWriter?.DeregisterHandler(_consoleLogHandler);
         }
+
+        await agent.DisposeAsync();
+    }
+
+    /// <summary>
+    /// Writes a Go-style "[LEVEL] agent: message" line. The line goes through the agent's log writer
+    /// (so monitor clients see it too) and therefore to the console via the level filter.
+    /// </summary>
+    private void LogLine(LogLevel level, string message)
+    {
+        var line = $"{level.ToPrefix()} agent: {message}";
+        var agentWriter = _agent?.LogWriter;
+        if (agentWriter != null)
+        {
+            agentWriter.WriteLine(line);
+        }
+        else
+        {
+            _logWriter?.WriteLine(line);
+        }
+
+        _logger?.Log(ToLoggerLevel(level), "[Agent] {Message}", message);
+    }
+
+    /// <summary>
+    /// Writes a status line straight to the console (Go: c.Ui.Output / c.Ui.Error), bypassing the log gate.
+    /// </summary>
+    private void WriteStatus(string message, bool error = false)
+    {
+        try
+        {
+            if (error)
+            {
+                Console.Error.WriteLine(message);
+                return;
+            }
+
+            (_originalOut ?? Console.Out).WriteLine(message);
+        }
+        catch (Exception)
+        {
+            // Console may be unavailable (e.g. closed stream); status output is best-effort
+        }
+    }
+
+    private static Microsoft.Extensions.Logging.LogLevel ToLoggerLevel(LogLevel level) => level switch
+    {
+        LogLevel.Trace => Microsoft.Extensions.Logging.LogLevel.Trace,
+        LogLevel.Debug => Microsoft.Extensions.Logging.LogLevel.Debug,
+        LogLevel.Info => Microsoft.Extensions.Logging.LogLevel.Information,
+        LogLevel.Warn => Microsoft.Extensions.Logging.LogLevel.Warning,
+        _ => Microsoft.Extensions.Logging.LogLevel.Error
+    };
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_disposed) return;
+        _disposed = true;
+
+        // Unblock RunAsync if it is still waiting
+        Complete(0);
+
+        await StopAgentAsync();
+        RestoreConsole();
 
         _signalHandler.Dispose();
-        _shutdownCts.Dispose();
 
-        // Restore console output
         if (_gatedWriter != null)
         {
-            Console.SetOut(Console.Out);
             await _gatedWriter.DisposeAsync();
         }
         GC.SuppressFinalize(this);
+    }
+
+    /// <summary>
+    /// Forwards the agent's circular log buffer to the console log writer (level filtered).
+    /// </summary>
+    private sealed class ConsoleLogHandler(TextWriter writer) : CircularLogWriter.ILogHandler
+    {
+        public void HandleLog(string log) => writer.WriteLine(log);
     }
 }

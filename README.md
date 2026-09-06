@@ -1,12 +1,13 @@
 # NSerf
 
-NSerf is a full, from-scratch port of [HashiCorp Serf](https://www.serf.io/) to modern C#. The project mirrors Serf's decentralized cluster membership, failure detection, and event dissemination model while embracing idiomatic .NET patterns for concurrency, async I/O, and tooling. The codebase targets .NET 8+ and is currently in **beta** while the team polishes APIs and round-trips real-world workloads.
+NSerf is a full, from-scratch port of [HashiCorp Serf](https://www.serf.io/) to modern C#. The project mirrors Serf's decentralized cluster membership, failure detection, and event dissemination model while embracing idiomatic .NET patterns for concurrency, async I/O, and tooling. The codebase targets .NET 10 and is currently in **beta** while the team polishes APIs and round-trips real-world workloads.
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/BoolHak/NSerfProject)
 
 ## Table of Contents
 
 - [Key Differences](#key-differences-from-the-go-implementation)
+  - [Wire Format and Interoperability](#wire-format-and-interoperability)
 - [Repository Layout](#repository-layout)
 - [Getting Started](#getting-started)
 - [ASP.NET Core Integration](#aspnet-core-integration)
@@ -21,11 +22,33 @@ NSerf is a full, from-scratch port of [HashiCorp Serf](https://www.serf.io/) to 
 
 While the behaviour and surface area match Serf's reference implementation, a few platform-specific choices differ:
 
-- **Serialization** relies on the high-performance [MessagePack-CSharp](https://github.com/neuecc/MessagePack-CSharp) stack instead of Go's native MessagePack bindings, keeping message layouts identical to the original protocol.
-- **Compression** uses the built-in .NET `System.IO.Compression.GZipStream` for gossip payload compression, replacing the Go LZW (Lempel-Ziv-Welch) adapter while preserving wire compatibility.
+- **Serialization** relies on the high-performance [MessagePack-CSharp](https://github.com/neuecc/MessagePack-CSharp) stack instead of Go's `go-msgpack` bindings. Messages keep Go's *field order* but not Go's *encoding*: see [Wire Format and Interoperability](#wire-format-and-interoperability) below.
+- **Compression** uses the built-in .NET `System.IO.Compression.GZipStream` for gossip payload compression instead of Go's LZW (Lempel-Ziv-Welch) adapter. The compressed payloads are therefore not interchangeable with Go's.
 - **Async orchestration** embraces task-based patterns and the C# transaction-style locking helpers introduced during the port, matching Go's channel semantics without blocking threads.
 - **Lighthouse** - Join the cluster without hardcoding a node address
 - **Service Discovery** - A basic service discovery ready to be used with .net applications or other services using the CLI 
+
+### Wire Format and Interoperability
+
+> **NSerf is not wire compatible with Go Serf or Go memberlist. A cluster must consist of NSerf nodes only.** An NSerf node cannot join a Go Serf cluster, a Go node cannot join an NSerf cluster, and the Go `serf` CLI cannot talk to an NSerf agent over RPC (nor the NSerf CLI to a Go agent). Go interoperability is not a supported scenario.
+
+The framing (a leading message-type byte, compound messages, encryption envelope, relay/query/RPC command names and the numeric values of every message type, flag and filter) mirrors Go, but the MessagePack payloads and the compression envelope differ:
+
+| Aspect | Go serf / memberlist | NSerf |
+| --- | --- | --- |
+| Struct encoding | MessagePack **map** keyed by field name | MessagePack **array** (`[MessagePackObject]` with integer `[Key(n)]`), elements in Go's field order |
+| `LamportTime` | bare `uint64` | one-element array `[uint64]` (it is itself a `[MessagePackObject]`) |
+| `MessageQuery.Timeout` | `time.Duration` nanoseconds | .NET `TimeSpan` serialised as 100 ns ticks (`Int64`) |
+| `MessageQuery.Addr` | raw IP bytes | UTF-8 text of the IP address |
+| Gossip compression | `compress` type byte followed by a MessagePack `compress{Algo: LZW, Buf}` struct | `compress` type byte followed directly by the raw GZip stream (`System.IO.Compression.GZipStream`); no `compress{Algo, Buf}` struct is written |
+| Agent RPC (`RequestHeader`, `ResponseHeader`, request/response bodies) | map encoding | array encoding |
+
+Element order for the most common messages (all encoded as arrays):
+
+- Serf `join`: `[LTime, Node]`; `leave`: `[LTime, Node, Prune]`; `user-event`: `[LTime, Name, Payload, CC]`; `query`: `[LTime, ID, Addr, Port, SourceNode, Filters, Flags, RelayFactor, Timeout, Name, Payload]`. `MessageCodec.EncodeMessage` prefixes the Serf `MessageType` byte (leave=0, join=1, pushPull=2, userEvent=3, query=4, queryResponse=5, conflictResponse=6, keyRequest=7, keyResponse=8, relay=9).
+- memberlist `alive`: `[Incarnation, Node, Addr, Port, Meta, Vsn]`; `suspect`/`dead`: `[Incarnation, Node, From]`. `MessageEncoder.Encode` prefixes the memberlist `MessageType` byte (ping=0, indirectPing=1, ackResp=2, suspect=3, alive=4, dead=5, pushPull=6, compound=7, user=8, ...).
+
+The current encoding is pinned by `NSerfTests/Serf/WireFormatTests.cs`; any change to it must update those tests and this section together. All NSerf nodes in a cluster should run the same NSerf version.
 
 ## Repository Layout
 
@@ -55,7 +78,7 @@ NSerf/
 - **Memberlist** – Full port of HashiCorp's SWIM-based memberlist, including gossip broadcasting, indirect pinging, and encryption support.
 - **Serf** – Cluster coordination, state machine transitions, Lamport clocks, and query/event processing all live here.
 - **Client** – Typed RPC requests/responses and ergonomic helpers for building management tooling.
-- **CLI** – A drop-in `serf` CLI replacement built on `System.CommandLine`, sharing the same RPC surface and defaults as the Go binary.
+- **CLI** – A `serf`-style CLI built on `System.CommandLine`, mirroring the Go binary's commands, flags and defaults. It speaks NSerf's RPC encoding and therefore manages NSerf agents only (see [Wire Format and Interoperability](#wire-format-and-interoperability)).
 - **ChatExample** – Real-world distributed chat application demonstrating NSerf capabilities with SignalR and Docker.
 - **YarpExample** – Production-ready service discovery and load balancing with Microsoft YARP reverse proxy.
 - **BackendService** – Sample microservice demonstrating auto-registration and cluster participation.
@@ -63,7 +86,7 @@ NSerf/
 ## Getting Started
 
 ### Prerequisites
-- .NET SDK 8.0 (or newer)
+- .NET SDK 10.0 (or newer)
 - Docker Desktop (optional, for containerized deployment)
 
 ### Installation
@@ -343,14 +366,14 @@ Test coverage includes:
 
 ## Project Status
 
-NSerf is feature-complete relative to Serf 1.6.x but remains in **beta** while the team onboards additional users, tightens compatibility, and stabilizes the public API surface. Expect minor breaking changes as interoperability edge cases are addressed.
+NSerf is feature-complete relative to Serf 1.6.x (behaviour and API surface) but remains in **beta** while the team onboards additional users and stabilizes the public API surface. Expect minor breaking changes. NSerf is not wire compatible with Go Serf: clusters must consist of NSerf nodes only (see [Wire Format and Interoperability](#wire-format-and-interoperability)).
 
 **Current Status:**
 -  Core Serf protocol implementation
 -  SWIM-based memberlist gossip
 -  RPC client/server with authentication
 -  Join the cluster without hardcoding a node address
--  CLI tool (drop-in replacement)
+-  CLI tool mirroring the `serf` command set (NSerf agents only)
 -  ASP.NET Core integration
 -  Event handlers and queries
 -  Docker deployment examples

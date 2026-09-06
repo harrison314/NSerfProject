@@ -29,7 +29,6 @@ public class RpcServerVerificationTests
         var agent = new SerfAgent(config);
         await agent.StartAsync();
 
-        await Task.Delay(100);  // Let server start
 
         using var tcpClient = new TcpClient();
         await tcpClient.ConnectAsync("127.0.0.1", GetRpcPort(agent));
@@ -73,38 +72,41 @@ public class RpcServerVerificationTests
         var agent = new SerfAgent(config);
         await agent.StartAsync();
 
-        await Task.Delay(100);  // Let server start
 
-        var actualAddr = GetActualRpcAddress(agent);
-        var client = new RpcClient(new RpcConfig
-        {
-            Address = actualAddr
-        });
-        await client.ConnectAsync();
+        // RpcClient now owns the read side of its socket (background reader), so the raw exchange
+        // uses a dedicated TcpClient: first a valid handshake, then a duplicate one.
+        using var tcpClient = new TcpClient();
+        await tcpClient.ConnectAsync("127.0.0.1", GetRpcPort(agent));
+        var stream = tcpClient.GetStream();
 
         try
         {
-            // Get the underlying stream for raw MessagePack
-            var tcpClient = GetTcpClient(client);
-            var stream = tcpClient.GetStream();
+            var reader = new MessagePackStreamReader(stream);
 
-            // Act - Try handshake again (already done in ConnectAsync)
-            var handshakeRequest = new RequestHeader { Command = "handshake", Seq = 2 };
-            await MessagePackSerializer.SerializeAsync(stream, handshakeRequest);
-            var versionRequest = new HandshakeRequest { Version = 1 };
-            await MessagePackSerializer.SerializeAsync(stream, versionRequest);
+            // First handshake succeeds
+            await MessagePackSerializer.SerializeAsync(stream, new RequestHeader { Command = "handshake", Seq = 1 });
+            await MessagePackSerializer.SerializeAsync(stream, new HandshakeRequest { Version = 1 });
+            await stream.FlushAsync();
+
+            var firstBytes = await reader.ReadAsync(CancellationToken.None);
+            Assert.NotNull(firstBytes);
+            var first = MessagePackSerializer.Deserialize<ResponseHeader>(firstBytes.Value);
+            Assert.Equal(1UL, first.Seq);
+            Assert.Equal(string.Empty, first.Error);
+
+            // Act - Try handshake again
+            await MessagePackSerializer.SerializeAsync(stream, new RequestHeader { Command = "handshake", Seq = 2 });
+            await MessagePackSerializer.SerializeAsync(stream, new HandshakeRequest { Version = 1 });
             await stream.FlushAsync();
 
             // Read response
-            var reader = new MessagePackStreamReader(stream);
             var responseBytes = await reader.ReadAsync(CancellationToken.None);
-            if (responseBytes != null)
-            {
-                var response = MessagePackSerializer.Deserialize<ResponseHeader>(responseBytes.Value);
+            Assert.NotNull(responseBytes);
+            var response = MessagePackSerializer.Deserialize<ResponseHeader>(responseBytes.Value);
 
-                // Assert
-                Assert.Contains("duplicate", response.Error.ToLower());
-            }
+            // Assert
+            Assert.Equal(2UL, response.Seq);
+            Assert.Contains("duplicate", response.Error.ToLower());
         }
         finally
         {
@@ -129,7 +131,6 @@ public class RpcServerVerificationTests
 
         try
         {
-            await Task.Delay(100);  // Let server start
 
             // Create client but don't auth
             var actualAddr = GetActualRpcAddress(agent);
@@ -171,7 +172,6 @@ public class RpcServerVerificationTests
 
         try
         {
-            await Task.Delay(100);  // Let server start
 
             var actualAddr = GetActualRpcAddress(agent);
             var client = new RpcClient(new RpcConfig
@@ -211,7 +211,6 @@ public class RpcServerVerificationTests
 
         try
         {
-            await Task.Delay(100);  // Let server start
 
             var actualAddr = GetActualRpcAddress(agent);
             var client = new RpcClient(new RpcConfig
@@ -249,7 +248,6 @@ public class RpcServerVerificationTests
 
         try
         {
-            await Task.Delay(100);  // Let server start
 
             var exception = await Assert.ThrowsAsync<RpcException>(async () =>
             {
@@ -288,14 +286,6 @@ public class RpcServerVerificationTests
         return int.Parse(parts[1]);
     }
 
-    private TcpClient GetTcpClient(RpcClient client)
-    {
-        // Use reflection to get the underlying TcpClient
-        var field = typeof(RpcClient).GetField("_tcpClient",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-        return (TcpClient)field!.GetValue(client)!;
-    }
-
     private string GetActualRpcAddress(SerfAgent agent)
     {
         var rpcServerField = typeof(SerfAgent).GetField("_rpcServer",
@@ -325,7 +315,9 @@ public class RpcServerVerificationTests
 
         try
         {
-            await Task.Delay(200);  // Wait for Serf to fully initialize with tags
+            await NSerfTests.Serf.TestHelpers.WaitForConditionAsync(
+                () => agent.Serf?.LocalMember().Tags.GetValueOrDefault("role") == "web",
+                TimeSpan.FromSeconds(5), "local member tags were not initialized");
 
             var actualAddr = GetActualRpcAddress(agent);
             var client = new RpcClient(new RpcConfig { Address = actualAddr });
@@ -372,8 +364,6 @@ public class RpcServerVerificationTests
 
         try
         {
-            await Task.Delay(100);
-
             var actualAddr = GetActualRpcAddress(agent);
             var client = new RpcClient(new RpcConfig { Address = actualAddr });
             await client.ConnectAsync();
@@ -406,7 +396,6 @@ public class RpcServerVerificationTests
 
         var agent = new SerfAgent(config);
         await agent.StartAsync();
-        await Task.Delay(100);
 
         var actualAddr = GetActualRpcAddress(agent);
 

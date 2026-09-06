@@ -44,6 +44,23 @@ public static class LogLevelExtensions
         };
     }
 
+    /// <summary>
+    /// Parses a log level name (TRACE, DEBUG, INFO, WARN/WARNING, ERR/ERROR; case-insensitive).
+    /// Returns false for an unknown name (Go: "Invalid log level").
+    /// </summary>
+    public static bool TryFromString(string? level, out LogLevel result)
+    {
+        switch (level?.Trim().ToLowerInvariant())
+        {
+            case "trace": result = LogLevel.Trace; return true;
+            case "debug": result = LogLevel.Debug; return true;
+            case "info": result = LogLevel.Info; return true;
+            case "warn" or "warning": result = LogLevel.Warn; return true;
+            case "error" or "err": result = LogLevel.Error; return true;
+            default: result = LogLevel.Info; return false;
+        }
+    }
+
     public static bool IsAtLeast(this LogLevel current, LogLevel minimum)
     {
         return current >= minimum;

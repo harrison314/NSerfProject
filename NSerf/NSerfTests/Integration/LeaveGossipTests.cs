@@ -31,7 +31,7 @@ public class LeaveGossipTests : IDisposable
         Assert.True(joinResult.NumJoined > 0, "Node2 should join node1");
         Assert.Null(joinResult.Error);
 
-        await Task.Delay(500);
+        await WaitForMemberCountAsync(2, ml1, ml2);
 
         // Verify both nodes see each other
         Assert.Equal(2, ml1.NumMembers());
@@ -42,7 +42,7 @@ public class LeaveGossipTests : IDisposable
         Assert.Null(leaveError);
 
         // Wait for gossip to propagate
-        await Task.Delay(1000);
+        await WaitForStateAsync(NSerf.Memberlist.State.NodeStateType.Left, "node2", ml1);
 
         // ASSERT: Node1 should see node2 as Left (not Dead)
         var node2State = ml1.NodeMap.GetValueOrDefault("node2");
@@ -68,7 +68,7 @@ public class LeaveGossipTests : IDisposable
         // Join them into a cluster
         await ml2.JoinAsync(new[] { $"127.0.0.1:{config1.BindPort}" });
         await ml3.JoinAsync(new[] { $"127.0.0.1:{config1.BindPort}" });
-        await Task.Delay(500);
+        await WaitForMemberCountAsync(3, ml1, ml2, ml3);
 
         Assert.Equal(3, ml1.NumMembers());
         Assert.Equal(3, ml2.NumMembers());
@@ -76,7 +76,7 @@ public class LeaveGossipTests : IDisposable
 
         // ACT: Node2 leaves
         await ml2.LeaveAsync(TimeSpan.FromSeconds(2));
-        await Task.Delay(1000);
+        await WaitForStateAsync(NSerf.Memberlist.State.NodeStateType.Left, "node2", ml1, ml3);
 
         // ASSERT: Both node1 and node3 see node2 as Left
         var node1View = ml1.NodeMap.GetValueOrDefault("node2");
@@ -107,7 +107,7 @@ public class LeaveGossipTests : IDisposable
         {
             await memberlists[i].JoinAsync(new[] { "127.0.0.1:19106" });
         }
-        await Task.Delay(1000);
+        await WaitForMemberCountAsync(5, memberlists.ToArray());
 
         // Verify all see 5 members
         foreach (var ml in memberlists)
@@ -117,7 +117,7 @@ public class LeaveGossipTests : IDisposable
 
         // ACT: Node4 leaves
         await memberlists[4].LeaveAsync(TimeSpan.FromSeconds(2));
-        await Task.Delay(1000);
+        await WaitForStateAsync(NSerf.Memberlist.State.NodeStateType.Left, "node4", memberlists.Take(4).ToArray());
 
         // ASSERT: All other nodes see node4 as Left
         for (int i = 0; i < 4; i++)
@@ -164,14 +164,15 @@ public class LeaveGossipTests : IDisposable
         // Join them
         await ml2.JoinAsync(new[] { "127.0.0.1:19112" });
         await ml3.JoinAsync(new[] { "127.0.0.1:19112" });
-        await Task.Delay(500);
+        await WaitForMemberCountAsync(3, ml1, ml2, ml3);
 
         Assert.Equal(3, ml1.NumMembers());
 
         // ACT: Node2 and Node3 leave first
         await ml2.LeaveAsync(TimeSpan.FromSeconds(2));
         await ml3.LeaveAsync(TimeSpan.FromSeconds(2));
-        await Task.Delay(1000);
+        await WaitForStateAsync(NSerf.Memberlist.State.NodeStateType.Left, "node2", ml1);
+        await WaitForStateAsync(NSerf.Memberlist.State.NodeStateType.Left, "node3", ml1);
 
         // Node1 should see both as Left
         Assert.Equal(NSerf.Memberlist.State.NodeStateType.Left, 
@@ -187,6 +188,23 @@ public class LeaveGossipTests : IDisposable
         // ASSERT: Should return quickly since no alive nodes
         Assert.Null(error);
         Assert.True(duration.TotalSeconds < 2, $"Should return quickly, but took {duration.TotalSeconds}s");
+    }
+
+    private static Task WaitForMemberCountAsync(int expected, params NSerf.Memberlist.Memberlist[] memberlists)
+    {
+        return NSerfTests.Serf.TestHelpers.WaitForConditionAsync(
+            () => memberlists.All(ml => ml.NumMembers() == expected),
+            TimeSpan.FromSeconds(10),
+            () => $"cluster did not converge to {expected} members: [{string.Join(", ", memberlists.Select(ml => ml.NumMembers()))}]");
+    }
+
+    private static Task WaitForStateAsync(NSerf.Memberlist.State.NodeStateType expected, string nodeName, params NSerf.Memberlist.Memberlist[] observers)
+    {
+        return NSerfTests.Serf.TestHelpers.WaitForConditionAsync(
+            () => observers.All(ml => ml.NodeMap.GetValueOrDefault(nodeName)?.State == expected),
+            TimeSpan.FromSeconds(10),
+            () => $"{nodeName} did not become {expected} on every observer: " +
+            $"[{string.Join(", ", observers.Select(ml => ml.NodeMap.GetValueOrDefault(nodeName)?.State.ToString() ?? "<none>"))}]");
     }
 
     private NSerf.Memberlist.Configuration.MemberlistConfig CreateMemberlistConfig(string name, int port)

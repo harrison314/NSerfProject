@@ -72,13 +72,26 @@ public static class ScriptInvoker
         var psi = new ProcessStartInfo
         {
             FileName = shell,
-            Arguments = $"{flag} {script}",
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
             CreateNoWindow = true
         };
+
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            // cmd.exe consumes everything after /C verbatim.
+            psi.Arguments = $"{flag} {script}";
+        }
+        else
+        {
+            // "/bin/sh -c" must receive the whole script as ONE argument (Go: exec.Command(shell, flag, script)).
+            // A single Arguments string is re-split on whitespace, so "echo test" would run `echo`
+            // with $0 = "test" and print an empty line.
+            psi.ArgumentList.Add(flag);
+            psi.ArgumentList.Add(script);
+        }
 
         ConfigureEnvironmentVariables(psi, envVars);
 

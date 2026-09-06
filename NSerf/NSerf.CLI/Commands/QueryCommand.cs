@@ -3,7 +3,10 @@
 
 using System.CommandLine;
 using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using NSerf.CLI.Helpers;
+using NSerf.Client.Responses;
 
 namespace NSerf.CLI.Commands;
 
@@ -137,21 +140,74 @@ public static class QueryCommand
 
         var timeoutSecs = (uint)timeoutSeconds;
         var requestAck = !noAck;
-        
-        var queryId = await client.QueryAsync(
+
+        // Start the query and consume its ack / response / done records (Go: cmd/serf/command/query.go)
+        await using var query = await client.StartQueryAsync(
             name,
             payloadBytes,
-            nodeFilter,
+            string.IsNullOrEmpty(nodeFilter) ? null : [nodeFilter],
             tags,
             requestAck,
             timeoutSecs,
             cancellationToken);
 
-        Console.WriteLine($"Query '{name}' dispatched with ID: {queryId}");
-        
+        if (format == OutputFormatter.OutputFormat.Text)
+        {
+            Console.WriteLine($"Query '{name}' dispatched with ID: {query.Id}");
+        }
+
+        var acks = new List<string>();
+        var responses = new Dictionary<string, string>();
+
+        await foreach (var record in query.Records.ReadAllAsync(cancellationToken))
+        {
+            switch (record.Type)
+            {
+                case QueryRecordType.Ack:
+                    acks.Add(record.From);
+                    if (format == OutputFormatter.OutputFormat.Text)
+                    {
+                        Console.WriteLine($"Ack from '{record.From}'");
+                    }
+                    break;
+
+                case QueryRecordType.Response:
+                    var text = Encoding.UTF8.GetString(record.Payload);
+                    responses[record.From] = text;
+                    if (format == OutputFormatter.OutputFormat.Text)
+                    {
+                        Console.WriteLine($"Response from '{record.From}': {text}");
+                    }
+                    break;
+
+                case QueryRecordType.Done:
+                    // No further records follow; the channel completes right after this record
+                    break;
+            }
+        }
+
+        if (format == OutputFormatter.OutputFormat.Json)
+        {
+            var json = JsonSerializer.Serialize(new
+            {
+                Acks = requestAck ? acks : null,
+                Responses = responses
+            }, JsonOptions);
+            Console.WriteLine(json);
+            return;
+        }
+
         if (requestAck)
         {
-            Console.WriteLine("Waiting for acknowledgments...");
+            Console.WriteLine($"Total Acks: {acks.Count}");
         }
+
+        Console.WriteLine($"Total Responses: {responses.Count}");
     }
+
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        WriteIndented = true,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+    };
 }

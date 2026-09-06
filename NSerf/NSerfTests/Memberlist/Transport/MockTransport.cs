@@ -68,6 +68,12 @@ public class MockTransport : INodeAwareTransport
         _streamChannel = Channel.CreateUnbounded<NetworkStream>();
     }
 
+    /// <summary>
+    /// Test hook: when set and returning true for a destination transport name, UDP packets to that
+    /// destination are silently dropped (simulates a broken/one-way UDP path while TCP still works).
+    /// </summary>
+    public Func<string, bool>? ShouldDropPacketTo { get; set; }
+
     public (IPAddress Ip, int Port) FinalAdvertiseAddr(string ip, int port)
     {
         var parts = _addr.Split(':');
@@ -92,6 +98,12 @@ public class MockTransport : INodeAwareTransport
             // UDP behavior: Silently drop packets to non-existent destinations
             // This allows probes to timeout naturally instead of throwing exceptions
             // Real UDP doesn't fail when sending to non-existent addresses
+            return now;
+        }
+
+        if (ShouldDropPacketTo?.Invoke(dest._name) == true)
+        {
+            // Simulated UDP loss toward this destination
             return now;
         }
 

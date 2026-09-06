@@ -34,7 +34,8 @@ public class LeaveGossipRootCauseTest : IDisposable
         _memberlists.Add(ml2);
 
         await ml2.JoinAsync(new[] { "127.0.0.1:19201" });
-        await Task.Delay(500);
+        await NSerfTests.Serf.TestHelpers.WaitForConditionAsync(() => ml1.NumMembers() == 2 && ml2.NumMembers() == 2,
+            TimeSpan.FromSeconds(5), () => $"cluster did not converge: ml1={ml1.NumMembers()}, ml2={ml2.NumMembers()}");
 
         // Both see each other
         Assert.Equal(2, ml1.NumMembers());

@@ -154,11 +154,20 @@ public partial class Memberlist
                     return;
                 }
 
+                // A periodic timer keeps Go's ticker cadence: a probe round that runs long (a failed
+                // probe waits a full probe interval for indirect acks) consumes the pending tick instead
+                // of delaying the next round by another whole interval.
+                var period = Config.ProbeInterval > TimeSpan.Zero ? Config.ProbeInterval : TimeSpan.FromMilliseconds(1);
+                using var probeTimer = new PeriodicTimer(period);
                 while (!_shutdownCts.IsCancellationRequested)
                 {
                     try
                     {
-                        await Task.Delay(Config.ProbeInterval, _shutdownCts.Token);
+                        if (!await probeTimer.WaitForNextTickAsync(_shutdownCts.Token))
+                        {
+                            break;
+                        }
+
                         await ProbeAsync();
                     }
                     catch (OperationCanceledException)

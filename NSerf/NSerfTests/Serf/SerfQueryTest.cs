@@ -77,7 +77,7 @@ public class SerfQueryTest
         await serf2.JoinAsync(new[] { $"127.0.0.1:{port1}" }, false);
 
         // Wait for cluster to form and stabilize
-        await Task.Delay(1000); // Increased - need cluster fully stable before querying
+        await TestHelpers.WaitUntilNumNodesAsync(2, TimeSpan.FromSeconds(10), serf1, serf2);
         serf1.NumMembers().Should().Be(2);
         serf2.NumMembers().Should().Be(2);
 
@@ -216,9 +216,9 @@ public class SerfQueryTest
         // Form cluster: node2 and node3 join node1
         var port1 = serf1.Memberlist!.LocalNode.Port;
         await serf2.JoinAsync(new[] { $"127.0.0.1:{port1}" }, false);
-        await Task.Delay(300);
+        await TestHelpers.WaitUntilNumNodesAsync(2, TimeSpan.FromSeconds(10), serf1, serf2);
         await serf3.JoinAsync(new[] { $"127.0.0.1:{port1}" }, false);
-        await Task.Delay(1000);
+        await TestHelpers.WaitUntilNumNodesAsync(3, TimeSpan.FromSeconds(10), serf1, serf2, serf3);
         serf1.NumMembers().Should().Be(3);
         serf2.NumMembers().Should().Be(3);
         serf3.NumMembers().Should().Be(3);
@@ -317,9 +317,9 @@ public class SerfQueryTest
         // Form cluster: node2 joins node1, then node3 joins node1
         var port1 = serf1.Memberlist!.LocalNode.Port;
         await serf2.JoinAsync(new[] { $"127.0.0.1:{port1}" }, false);
-        await Task.Delay(300);
+        await TestHelpers.WaitUntilNumNodesAsync(2, TimeSpan.FromSeconds(10), serf1, serf2);
         await serf3.JoinAsync(new[] { $"127.0.0.1:{port1}" }, false);
-        await Task.Delay(1000); // Increased - need cluster fully stable before querying
+        await TestHelpers.WaitUntilNumNodesAsync(3, TimeSpan.FromSeconds(10), serf1, serf2, serf3);
         serf1.NumMembers().Should().Be(3);
         serf2.NumMembers().Should().Be(3);
         serf3.NumMembers().Should().Be(3);
@@ -650,7 +650,7 @@ public class SerfQueryTest
         // Join cluster
         var port1 = serf1.Memberlist!.LocalNode.Port;
         await serf2.JoinAsync(new[] { $"127.0.0.1:{port1}" }, false);
-        await Task.Delay(500);
+        await TestHelpers.WaitUntilNumNodesAsync(2, TimeSpan.FromSeconds(10), serf1, serf2);
 
         // Act - Send query filtered to only "target-node"
         var queryParams = serf2.DefaultQueryParams();
@@ -659,7 +659,10 @@ public class SerfQueryTest
 
         var response = await serf2.QueryAsync("filtered-query", Array.Empty<byte>(), queryParams);
 
-        // Wait for responses
+        // Wait for the query to reach the target node, then give the (excluded) other node the same
+        // window it previously had to prove it does NOT receive it
+        await TestHelpers.WaitForConditionAsync(() => Volatile.Read(ref targetReceived), TimeSpan.FromSeconds(5),
+            "target-node never received the filtered query");
         await Task.Delay(500);
 
         // Assert - Only target-node should have received the query

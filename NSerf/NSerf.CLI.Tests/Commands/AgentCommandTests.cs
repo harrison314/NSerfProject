@@ -84,8 +84,21 @@ public class AgentCommandTests
         // Act - start agent in background
         var agentTask = Task.Run(async () => await rootCommand.Parse(args).InvokeAsync());
 
-        // Wait for agent and RPC server to start
-        await Task.Delay(500);
+        // Wait for agent and RPC server to start (poll until the RPC port accepts connections)
+        Assert.True(await NSerf.CLI.Tests.Helpers.TestHelper.WaitForConditionAsync(async () =>
+        {
+            try
+            {
+                var parts = rpcAddr.Split(':');
+                using var probe = new System.Net.Sockets.TcpClient();
+                await probe.ConnectAsync(parts[0], int.Parse(parts[1]));
+                return true;
+            }
+            catch (System.Net.Sockets.SocketException)
+            {
+                return false;
+            }
+        }, TimeSpan.FromSeconds(5)), "RPC server never started listening");
 
         try
         {
@@ -130,6 +143,7 @@ public class AgentCommandTests
         {
             "agent",
             "--bind", bindAddr,
+            "--rpc-addr", "127.0.0.1:0",
             "--join", agent1BindAddr,
             "--replay"
         };
@@ -138,7 +152,8 @@ public class AgentCommandTests
         var agentTask = Task.Run(async () => await rootCommand.Parse(args).InvokeAsync());
 
         // Wait for join to complete
-        await Task.Delay(1000);
+        Assert.True(await NSerf.CLI.Tests.Helpers.TestHelper.WaitForConditionAsync(() => fixture.Agent!.Serf!.Members().Length == 2, TimeSpan.FromSeconds(5)),
+            "first agent never saw the joining agent");
 
         try
         {
@@ -172,6 +187,7 @@ public class AgentCommandTests
         {
             "agent",
             "--bind", bindAddr,
+            "--rpc-addr", "127.0.0.1:0",
             "--join", nonExistentAddr
         };
 

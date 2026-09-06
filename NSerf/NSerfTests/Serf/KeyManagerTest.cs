@@ -196,7 +196,10 @@ public class KeyManagerTest
             response.NumErr.Should().Be(0, "should have no errors");
             
             // Verify new key installed on all nodes
-            await Task.Delay(200); // Allow time for propagation
+            await TestHelpers.WaitForConditionAsync(
+                () => KeyCount(serf1) == 2 && KeyCount(serf2) == 2 && KeyCount(serf3) == 2,
+                TimeSpan.FromSeconds(5),
+                () => $"new key not installed everywhere: counts = {KeyCount(serf1)}, {KeyCount(serf2)}, {KeyCount(serf3)}");
             
             var keys1 = serf1.Config.MemberlistConfig!.Keyring!.GetKeys();
             var keys2 = serf2.Config.MemberlistConfig!.Keyring!.GetKeys();
@@ -250,7 +253,8 @@ public class KeyManagerTest
             // Install second key on both nodes
             var manager = new KeyManager(serf1);
             await manager.InstallKey(key2);
-            await Task.Delay(200);
+            await TestHelpers.WaitForConditionAsync(() => KeyCount(serf1) == 2 && KeyCount(serf2) == 2,
+                TimeSpan.FromSeconds(5), () => $"key2 not installed on both nodes: counts = {KeyCount(serf1)}, {KeyCount(serf2)}");
             
             // Verify key1 is still primary
             var primaryKey1Before = serf1.Config.MemberlistConfig!.Keyring!.GetPrimaryKey();
@@ -265,7 +269,8 @@ public class KeyManagerTest
             response.NumErr.Should().Be(0, "should have no errors");
             response.NumResp.Should().BeGreaterThan(0, "should receive responses");
             
-            await Task.Delay(200);
+            await TestHelpers.WaitForConditionAsync(() => PrimaryKey(serf1) == key2 && PrimaryKey(serf2) == key2,
+                TimeSpan.FromSeconds(5), () => $"key2 did not become primary on both nodes: {PrimaryKey(serf1)}, {PrimaryKey(serf2)}");
             
             // Verify key2 is now primary on all nodes
             var primaryKey1After = serf1.Config.MemberlistConfig!.Keyring!.GetPrimaryKey();
@@ -310,7 +315,9 @@ public class KeyManagerTest
             var manager = new KeyManager(serf1);
             await manager.InstallKey(key2);
             await manager.UseKey(key2);
-            await Task.Delay(200);
+            await TestHelpers.WaitForConditionAsync(
+                () => KeyCount(serf1) == 2 && KeyCount(serf2) == 2 && PrimaryKey(serf1) == key2 && PrimaryKey(serf2) == key2,
+                TimeSpan.FromSeconds(5), "key2 not installed and primary on both nodes");
             
             // Verify both keys exist
             serf1.Config.MemberlistConfig!.Keyring!.GetKeys().Should().HaveCount(2);
@@ -321,7 +328,8 @@ public class KeyManagerTest
             
             // Assert
             response.NumErr.Should().Be(0, "should have no errors");
-            await Task.Delay(200);
+            await TestHelpers.WaitForConditionAsync(() => KeyCount(serf1) == 1 && KeyCount(serf2) == 1,
+                TimeSpan.FromSeconds(5), () => $"key1 not removed from both nodes: counts = {KeyCount(serf1)}, {KeyCount(serf2)}");
             
             // Verify key1 removed from all nodes
             var keys1 = serf1.Config.MemberlistConfig!.Keyring!.GetKeys();
@@ -474,6 +482,14 @@ public class KeyManagerTest
         }
     }
     
+    private static int KeyCount(NSerf.Serf.Serf serf) => serf.Config.MemberlistConfig!.Keyring!.GetKeys().Count;
+
+    private static string? PrimaryKey(NSerf.Serf.Serf serf)
+    {
+        var key = serf.Config.MemberlistConfig!.Keyring!.GetPrimaryKey();
+        return key == null ? null : Convert.ToBase64String(key);
+    }
+
     private static async Task<SerfSerf> CreateSerfWithEncryption(string nodeName, string base64Key)
     {
         var config = new Config

@@ -145,6 +145,15 @@ public class SnapshotterUnitTest : IDisposable
             inCh.TryWrite(joinEvent);
         }
 
+        // Make sure at least one event reached the stream loop before shutting down, so the
+        // persistence assertion below is about the shutdown drain rather than scheduling
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (snap.AliveNodes().Count == 0 && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(10);
+        }
+        snap.AliveNodes().Should().Contain(n => n.Name == "test1", "the first event should have been processed");
+
         // Shutdown should complete within reasonable time
         shutdownCts.Cancel();
         var sw = Stopwatch.StartNew();
@@ -154,6 +163,13 @@ public class SnapshotterUnitTest : IDisposable
         // Assert - completed within 2 seconds (generous timeout for safety)
         sw.ElapsedMilliseconds.Should().BeLessThan(2000,
             "shutdown should complete quickly even with pending events");
+
+        // Note: with minCompactSize=1024 the drain also triggers compactions (which fsync);
+        // the per-event fsync cost is asserted in SnapshotterDurabilityAndDisposalTests.
+        var content = await File.ReadAllTextAsync(path);
+        content.Should().Contain("alive: test1", "drained events must be persisted");
+
+        await snap.DisposeAsync();
     }
 
     // ==================== Test Group A: Disposal & Lifecycle ====================

@@ -199,13 +199,24 @@ public partial class Memberlist : IDisposable, IAsyncDisposable
     public Node LocalNode => _localNode ?? throw new InvalidOperationException("Local node not initialized");
 
     /// <summary>
-    /// Returns the number of members in the cluster from this node's perspective.
+    /// Returns the number of alive (not dead or left) members in the cluster from this node's
+    /// perspective. Dead and left nodes remain in the node map until they are reaped but are
+    /// not counted here (Go: Memberlist.NumMembers). Use <see cref="EstNumNodes"/> for the
+    /// estimate that drives retransmit and suspicion scaling.
     /// </summary>
     public int NumMembers()
     {
         lock (NodeLock)
         {
-            return NodeMap.Count;
+            var alive = 0;
+            foreach (var node in Nodes)
+            {
+                if (!node.DeadOrLeft())
+                {
+                    alive++;
+                }
+            }
+            return alive;
         }
     }
 
@@ -467,15 +478,6 @@ public partial class Memberlist : IDisposable, IAsyncDisposable
                 return;
             }
 
-            // Check if we should skip broadcasting our own messages based on config
-            // EXCEPTION: Always broadcast Dead messages for graceful leave, even if reclaim time is 0
-            if (node == Config.Name && Config.DeadNodeReclaimTime == TimeSpan.Zero && msgType != MessageType.Dead)
-            {
-                // Don't broadcast our own state changes if reclaim time is 0
-                _logger?.LogDebug("Skipping broadcast for local node {Node} (reclaim time is 0)", node);
-                return;
-            }
-
             QueueBroadcast(node, msgType, encoded, notify);
         }
         catch (Exception ex)
@@ -535,8 +537,13 @@ public partial class Memberlist : IDisposable, IAsyncDisposable
             Addr = localNode.Addr.GetAddressBytes(),
             Port = localNode.Port,
             Meta = meta,
+            // Go's UpdateNode sends the full six-entry version vector
+            // [pmin, pmax, pcur, dmin, dmax, dcur]; receivers read slots 0-2 as the
+            // protocol range and discard the message when pmax is zero.
             Vsn =
             [
+                ProtocolVersion.Min,
+                ProtocolVersion.Max,
                 Config.ProtocolVersion,
                 Config.DelegateProtocolMin,
                 Config.DelegateProtocolMax,
@@ -574,13 +581,8 @@ public partial class Memberlist : IDisposable, IAsyncDisposable
             Config.Events.NotifyUpdate(localState.Node);
         }
 
-        // Step 5c: Broadcast the update to the cluster
-        EncodeAndBroadcast(Config.Name, MessageType.Alive, alive);
-
-        // Step 6: Wait briefly to allow broadcast to be queued
-        // In Go, this waits for the broadcast to be transmitted, but in our implementation
-        // EncodeAndBroadcast queues the message immediately, so we just need a small delay
-        // to ensure the broadcast queue has processed it
+        // Step 5c: Broadcast the update and, if there is anyone to tell, wait (bounded by the
+        // timeout) until it has been transmitted the configured number of times (Go: UpdateNode).
         bool hasOtherNodes;
         lock (NodeLock)
         {
@@ -591,11 +593,12 @@ public partial class Memberlist : IDisposable, IAsyncDisposable
                 n.Name != Config.Name);
         }
 
-        if (hasOtherNodes && timeout > TimeSpan.Zero)
+        var notify = hasOtherNodes && timeout > TimeSpan.Zero ? new BroadcastNotifyChannel() : null;
+        EncodeBroadcastNotify(Config.Name, MessageType.Alive, alive, notify);
+
+        if (notify != null && !await notify.WaitAsync(timeout))
         {
-            // Brief delay to allow broadcast queue to process
-            // This matches the Go behavior where we wait for the broadcast to be sent
-            await Task.Delay(TimeSpan.FromMilliseconds(10));
+            throw new TimeoutException("timed out broadcasting node update");
         }
     }
 

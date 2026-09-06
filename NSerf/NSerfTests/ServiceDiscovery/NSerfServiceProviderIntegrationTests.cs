@@ -44,7 +44,7 @@ public class NSerfServiceProviderIntegrationTests : IDisposable
 
         // Act
         await provider.StartAsync();
-        await Task.Delay(500); // Allow time for discovery
+        await WaitForServiceCountAsync(provider, 1); // Allow time for discovery
 
         var services = await provider.DiscoverServicesAsync();
 
@@ -85,7 +85,7 @@ public class NSerfServiceProviderIntegrationTests : IDisposable
 
         // Act
         await provider.StartAsync();
-        await Task.Delay(500);
+        await WaitForServiceCountAsync(provider, 3);
 
         var services = await provider.DiscoverServicesAsync();
 
@@ -154,7 +154,7 @@ public class NSerfServiceProviderIntegrationTests : IDisposable
 
         // Act
         await provider.StartAsync();
-        await Task.Delay(500);
+        await WaitForServiceCountAsync(provider, 1);
 
         var services = await provider.DiscoverServicesAsync();
 
@@ -193,7 +193,8 @@ public class NSerfServiceProviderIntegrationTests : IDisposable
 
         // Act
         await provider.StartAsync();
-        await Task.Delay(1000); // Give time for event processing
+        await NSerfTests.Serf.TestHelpers.WaitForConditionAsync(() => Volatile.Read(ref eventRaised), TimeSpan.FromSeconds(5),
+            "ServiceDiscovered event was never raised"); // Give time for event processing
 
         // Assert
         Assert.True(eventRaised, "ServiceDiscovered event should be raised");
@@ -227,7 +228,7 @@ public class NSerfServiceProviderIntegrationTests : IDisposable
 
         // Act & Assert - First cycle
         await provider.StartAsync();
-        await Task.Delay(300);
+        await WaitForServiceCountAsync(provider, 1);
         var services1 = await provider.DiscoverServicesAsync();
         Assert.Single(services1);
 
@@ -236,7 +237,7 @@ public class NSerfServiceProviderIntegrationTests : IDisposable
 
         // Second cycle
         await provider.StartAsync();
-        await Task.Delay(300);
+        await WaitForServiceCountAsync(provider, 1);
         var services2 = await provider.DiscoverServicesAsync();
         Assert.Single(services2);
 
@@ -267,7 +268,8 @@ public class NSerfServiceProviderIntegrationTests : IDisposable
             provider2.StartAsync()
         );
 
-        await Task.Delay(500);
+        await WaitForServiceCountAsync(provider1, 1);
+        await WaitForServiceCountAsync(provider2, 1);
 
         var services1 = await provider1.DiscoverServicesAsync();
         var services2 = await provider2.DiscoverServicesAsync();
@@ -304,7 +306,7 @@ public class NSerfServiceProviderIntegrationTests : IDisposable
 
         // Act
         await provider.StartAsync();
-        await Task.Delay(500);
+        await WaitForServiceCountAsync(provider, 1);
 
         var services = await provider.DiscoverServicesAsync();
 
@@ -339,7 +341,7 @@ public class NSerfServiceProviderIntegrationTests : IDisposable
 
         // Act
         await provider.StartAsync();
-        await Task.Delay(500);
+        await WaitForServiceCountAsync(provider, 2);
 
         var services = await provider.DiscoverServicesAsync();
 
@@ -371,7 +373,7 @@ public class NSerfServiceProviderIntegrationTests : IDisposable
 
         // Act
         await provider.StartAsync();
-        await Task.Delay(500);
+        await WaitForServiceCountAsync(provider, 3);
 
         var services = await provider.DiscoverServicesAsync();
 
@@ -389,6 +391,16 @@ public class NSerfServiceProviderIntegrationTests : IDisposable
     }
 
     #region Helper Methods
+
+    /// <summary>Polls the provider until it reports exactly <paramref name="count"/> distinct services.</summary>
+    private static Task WaitForServiceCountAsync(NSerfServiceProvider provider, int count)
+    {
+        return NSerfTests.Serf.TestHelpers.WaitForConditionAsync(
+            async () => (await provider.DiscoverServicesAsync()).Count == count,
+            TimeSpan.FromSeconds(5),
+            () => $"provider did not reach {count} services; sees " +
+                  $"[{string.Join(", ", provider.DiscoverServicesAsync().GetAwaiter().GetResult().Select(s => s.Name))}]");
+    }
 
     private Config CreateSerfConfig(string nodeName, int port, Dictionary<string, string> tags)
     {

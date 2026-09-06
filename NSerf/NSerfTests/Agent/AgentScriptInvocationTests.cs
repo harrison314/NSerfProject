@@ -28,6 +28,20 @@ public class AgentScriptInvocationTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// Waits (up to 10 s) for the handler script to create the marker file. A fixed 2 s sleep was
+    /// flaky when the thread pool is busy during a full test run.
+    /// </summary>
+    private async Task WaitForMarkerAsync(string? markerFile = null)
+    {
+        markerFile ??= _markerFile;
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (!File.Exists(markerFile) && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(50);
+        }
+    }
+
     private string CreateTestScript()
     {
         string scriptPath;
@@ -76,7 +90,7 @@ public class AgentScriptInvocationTests : IDisposable
         await using var agent = new SerfAgent(config);
         await agent.StartAsync();
 
-        await Task.Delay(2000);
+        await WaitForMarkerAsync();
 
         Assert.True(File.Exists(_markerFile), $"Script was not executed. Marker file not found: {_markerFile}");
 
@@ -101,7 +115,7 @@ public class AgentScriptInvocationTests : IDisposable
         await using var agent = new SerfAgent(config);
         await agent.StartAsync();
 
-        await Task.Delay(2000);
+        await WaitForMarkerAsync();
 
         Assert.True(File.Exists(_markerFile), $"Script was not executed. Marker file not found: {_markerFile}");
 
@@ -152,7 +166,7 @@ public class AgentScriptInvocationTests : IDisposable
         Assert.NotNull(agent.Serf);
         await agent.Serf.UserEventAsync("test-event", [], false);
 
-        await Task.Delay(2000);
+        await WaitForMarkerAsync();
 
         Assert.True(File.Exists(_markerFile), $"Script was not executed for user event. Marker file not found: {_markerFile}");
 
@@ -274,7 +288,7 @@ public class AgentScriptInvocationTests : IDisposable
         await using var agent = new SerfAgent(config);
         await agent.StartAsync();
 
-        await Task.Delay(2000);
+        await WaitForMarkerAsync();
 
         Assert.True(File.Exists(_markerFile), $"Script was not executed. Marker file not found: {_markerFile}");
 
@@ -327,7 +341,7 @@ public class AgentScriptInvocationTests : IDisposable
         await using var agent = new SerfAgent(config);
         await agent.StartAsync();
 
-        await Task.Delay(2000);
+        await WaitForMarkerAsync();
 
         Assert.True(File.Exists(_markerFile), $"Script was not executed. Marker file not found: {_markerFile}");
 
@@ -378,7 +392,8 @@ public class AgentScriptInvocationTests : IDisposable
         await using var agent = new SerfAgent(config);
         await agent.StartAsync();
 
-        await Task.Delay(2000);
+        await WaitForMarkerAsync(markerFile1);
+        await WaitForMarkerAsync(markerFile2);
 
         Assert.True(File.Exists(markerFile1), "First handler was not executed");
         Assert.True(File.Exists(markerFile2), "Second handler was not executed");
@@ -410,7 +425,7 @@ public class AgentScriptInvocationTests : IDisposable
         await using var agent = new SerfAgent(config);
         await agent.StartAsync();
 
-        await Task.Delay(2000);
+        await WaitForMarkerAsync();
 
         Assert.True(File.Exists(_markerFile), $"Script was not executed from config file. Marker file not found: {_markerFile}");
 

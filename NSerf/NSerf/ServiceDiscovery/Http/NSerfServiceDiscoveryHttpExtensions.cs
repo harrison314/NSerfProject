@@ -28,10 +28,12 @@ public static class NSerfServiceDiscoveryHttpExtensions
     {
         ArgumentNullException.ThrowIfNull(services);
 
-        // Register options
+        // Register options. The handler below resolves them through IOptions so that the
+        // configured values (e.g. the load-balancing strategy) are actually applied.
+        var optionsBuilder = services.AddOptions<ServiceDiscoveryHttpOptions>();
         if (configureOptions != null)
         {
-            services.Configure(configureOptions);
+            optionsBuilder.Configure(configureOptions);
         }
 
         // Add a service discovery handler to all HTTP clients by default
@@ -40,12 +42,10 @@ public static class NSerfServiceDiscoveryHttpExtensions
             builder.AddHttpMessageHandler(sp =>
             {
                 var registry = sp.GetRequiredService<IServiceRegistry>();
-                var options = configureOptions != null
-                    ? Microsoft.Extensions.Options.Options.Create(new ServiceDiscoveryHttpOptions())
-                    : null;
+                var options = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<ServiceDiscoveryHttpOptions>>().Value;
                 var logger = sp.GetService<Microsoft.Extensions.Logging.ILogger<ServiceDiscoveryHttpMessageHandler>>();
 
-                return new ServiceDiscoveryHttpMessageHandler(registry, options?.Value, logger);
+                return new ServiceDiscoveryHttpMessageHandler(registry, options, logger);
             });
         });
 

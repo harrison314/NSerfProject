@@ -134,6 +134,18 @@ public class AgentConfigVerificationTests
     }
 
     [Fact]
+    public void AgentConfig_Merge_ReplayOnJoin_IsPreserved()
+    {
+        // Go: if b.ReplayOnJoin { result.ReplayOnJoin = true } - the CLI's --replay must survive the merge
+        var fromFile = new AgentConfig(replayOnJoin: false);
+        var fromCli = new AgentConfig(replayOnJoin: true);
+
+        Assert.True(AgentConfig.Merge(fromFile, fromCli).ReplayOnJoin);
+        Assert.True(AgentConfig.Merge(fromCli, fromFile).ReplayOnJoin);
+        Assert.False(AgentConfig.Merge(fromFile, new AgentConfig()).ReplayOnJoin);
+    }
+
+    [Fact]
     public void AgentConfig_Merge_Tags_AreMerged()
     {
         // Arrange

@@ -4,9 +4,11 @@
 using System.Net;
 using System.Net.Sockets;
 using System.Threading.Channels;
+using Microsoft.Extensions.Logging;
 using NSerf.Serf;
 using NSerf.Serf.Events;
 using NSerf.Memberlist.Configuration;
+using NSerf.Metrics;
 
 namespace NSerfTests.Serf;
 
@@ -349,10 +351,22 @@ public static class TestHelpers
     /// Waits for a specific condition to become true with polling.
     /// Useful for waiting on eventual consistency conditions.
     /// </summary>
-    public static async Task WaitForConditionAsync(
+    public static Task WaitForConditionAsync(
         Func<bool> condition,
         TimeSpan timeout,
         string? errorMessage = null)
+    {
+        return WaitForConditionAsync(condition, timeout, () => errorMessage ?? "Condition not met within timeout");
+    }
+
+    /// <summary>
+    /// Waits for a condition to become true with polling. The error message factory is only
+    /// evaluated on timeout, so it can describe the state observed at that moment.
+    /// </summary>
+    public static async Task WaitForConditionAsync(
+        Func<bool> condition,
+        TimeSpan timeout,
+        Func<string> errorMessage)
     {
         using var cts = new CancellationTokenSource(timeout);
 
@@ -373,7 +387,55 @@ public static class TestHelpers
             }
         }
 
-        throw new TimeoutException(errorMessage ?? "Condition not met within timeout");
+        throw new TimeoutException(errorMessage());
+    }
+
+    /// <summary>
+    /// Waits for an asynchronous condition (e.g. an RPC response or a provider query) to become
+    /// true with polling. The error message factory is only evaluated on timeout so it can
+    /// describe the last observed state.
+    /// </summary>
+    public static async Task WaitForConditionAsync(
+        Func<Task<bool>> condition,
+        TimeSpan timeout,
+        Func<string>? errorMessage = null)
+    {
+        using var cts = new CancellationTokenSource(timeout);
+
+        while (!cts.Token.IsCancellationRequested)
+        {
+            if (await condition())
+            {
+                return;
+            }
+
+            try
+            {
+                await Task.Delay(10, cts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+        }
+
+        throw new TimeoutException(errorMessage?.Invoke() ?? "Condition not met within timeout");
+    }
+
+    /// <summary>
+    /// Waits until <paramref name="serf"/> reports <paramref name="nodeName"/> with the given status.
+    /// </summary>
+    public static Task WaitForMemberStatusAsync(
+        NSerf.Serf.Serf serf,
+        string nodeName,
+        MemberStatus status,
+        TimeSpan timeout)
+    {
+        return WaitForConditionAsync(
+            () => serf.Members().FirstOrDefault(m => m.Name == nodeName)?.Status == status,
+            timeout,
+            () => $"Timeout waiting for {nodeName} to be {status}; current status: " +
+                  $"{serf.Members().FirstOrDefault(m => m.Name == nodeName)?.Status.ToString() ?? "<not a member>"}");
     }
 
     /// <summary>
@@ -391,4 +453,22 @@ public static class TestHelpers
 
         return configs;
     }
+}
+
+/// <summary>
+/// Test-only configuration template returned by <see cref="TestHelpers.CreateTestConfig"/>.
+/// Tests copy the relevant values into a real <see cref="Config"/> before creating a Serf instance.
+/// (This type used to live in the NSerf library as a leftover of the early port and was never used there.)
+/// </summary>
+public class SerfConfig
+{
+    public string NodeName { get; set; } = string.Empty;
+    public MemberlistConfig MemberlistConfig { get; set; } = new();
+    public ILogger? Logger { get; set; }
+    public IMetrics Metrics { get; set; } = NullMetrics.Instance;
+    public MetricLabel[] MetricLabels { get; set; } = [];
+    public TimeSpan ReapInterval { get; set; } = TimeSpan.FromSeconds(15);
+    public TimeSpan ReconnectInterval { get; set; } = TimeSpan.FromSeconds(30);
+    public TimeSpan ReconnectTimeout { get; set; } = TimeSpan.FromHours(24);
+    public TimeSpan TombstoneTimeout { get; set; } = TimeSpan.FromHours(24);
 }

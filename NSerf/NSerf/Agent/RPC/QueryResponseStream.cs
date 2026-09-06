@@ -9,16 +9,26 @@ namespace NSerf.Agent.RPC;
 
 /// <summary>
 /// QueryResponseStream handles streaming query acks and responses back to the RPC client.
+/// Every record is framed as ResponseHeader{Seq = query command seq} + <see cref="QueryRecord"/>.
+/// Disposing the stream (the stop command, or the session closing) stops further records.
 /// Maps to: Go's queryResponseStream in ipc_query_response_stream.go
 /// </summary>
-internal class QueryResponseStream(
+internal sealed class QueryResponseStream(
     SemaphoreSlim writeLock,
     Stream stream,
     ulong seq,
-    Serf.QueryResponse queryResponse)
+    Serf.QueryResponse queryResponse) : IDisposable
 {
     private static readonly MessagePackSerializerOptions MsgPackOptions =
         MessagePackSerializerOptions.Standard.WithCompression(MessagePackCompression.None);
+
+    private readonly CancellationTokenSource _stopCts = new();
+    private volatile bool _disposed;
+
+    /// <summary>
+    /// Seq of the query command that opened this stream.
+    /// </summary>
+    public ulong Seq => seq;
 
     /// <summary>
     /// Stream is a long-running routine that streams query results back to the client.
@@ -28,15 +38,18 @@ internal class QueryResponseStream(
     {
         try
         {
+            using var sessionCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _stopCts.Token);
+            var sessionToken = sessionCts.Token;
+
             // Setup timer for query deadline
             var remaining = queryResponse.Deadline - DateTime.UtcNow;
             if (remaining <= TimeSpan.Zero)
             {
-                await SendDoneAsync(cancellationToken);
+                await SendDoneAsync(sessionToken);
                 return;
             }
 
-            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(sessionToken);
             timeoutCts.CancelAfter(remaining);
 
             var ackCh = queryResponse.AckCh;
@@ -60,6 +73,12 @@ internal class QueryResponseStream(
                         continue;
                     }
 
+                    // Serf closes both channels once the query has finished
+                    if (respCh.Completion.IsCompleted && (ackCh == null || ackCh.Completion.IsCompleted))
+                    {
+                        break;
+                    }
+
                     // Small delay to avoid busy-waiting
                     await Task.Delay(10, timeoutCts.Token);
                 }
@@ -69,12 +88,17 @@ internal class QueryResponseStream(
                 // Timeout reached or cancellation requested
             }
 
-            // Send done marker
-            await SendDoneAsync(timeoutCts.Token);
+            // Send done marker (Go: sends the done record once the deadline passes); the timeout token
+            // is already cancelled at this point so the write uses the session token.
+            await SendDoneAsync(sessionToken);
         }
         catch (Exception)
         {
-            // Swallow exceptions - client may have disconnected
+            // Swallow exceptions - client may have disconnected or the stream was stopped
+        }
+        finally
+        {
+            _stopCts.Dispose();
         }
     }
 
@@ -119,6 +143,10 @@ internal class QueryResponseStream(
         await writeLock.WaitAsync(cancellationToken);
         try
         {
+            // Re-check under the lock: a stop that completed while we waited must not be followed by a record
+            if (_disposed)
+                return;
+
             var header = new ResponseHeader { Seq = seq, Error = string.Empty };
             var headerBytes = MessagePackSerializer.Serialize(header, MsgPackOptions, cancellationToken);
             await stream.WriteAsync(headerBytes, cancellationToken);
@@ -130,6 +158,25 @@ internal class QueryResponseStream(
         finally
         {
             writeLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Stops the stream: no further records (not even 'done') are written for this seq.
+    /// </summary>
+    public void Dispose()
+    {
+        if (_disposed)
+            return;
+
+        _disposed = true;
+        try
+        {
+            _stopCts.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            // Already torn down
         }
     }
 }

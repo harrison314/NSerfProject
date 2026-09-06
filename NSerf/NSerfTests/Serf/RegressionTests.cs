@@ -43,6 +43,32 @@ public class RegressionTests : IDisposable
     }
 
     /// <summary>
+    /// Polls the snapshot file until it contains <paramref name="expected"/> (the snapshotter flushes
+    /// on a 500ms timer, so the file lags the in-memory state).
+    /// </summary>
+    private static Task WaitForSnapshotContentAsync(string path, string expected, TimeSpan timeout)
+    {
+        return TestHelpers.WaitForConditionAsync(
+            () => ReadSnapshotOrEmpty(path).Contains(expected),
+            timeout,
+            () => $"snapshot {path} did not contain '{expected}' within {timeout}");
+    }
+
+    private static string ReadSnapshotOrEmpty(string path)
+    {
+        try
+        {
+            using var fs = new System.IO.FileStream(path, System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.ReadWrite);
+            using var reader = new System.IO.StreamReader(fs);
+            return reader.ReadToEnd();
+        }
+        catch (System.IO.IOException)
+        {
+            return string.Empty;
+        }
+    }
+
+    /// <summary>
     /// Regression Test #1: SO_REUSEADDR Socket Binding
     /// Bug: Rapid test execution caused "socket access denied" errors due to TIME_WAIT
     /// Fix: Added SO_REUSEADDR option to TCP and UDP listeners in NetTransport.cs
@@ -122,15 +148,15 @@ public class RegressionTests : IDisposable
 
         // Join the nodes
         await s1.JoinAsync(new[] { $"127.0.0.1:{config2.MemberlistConfig.BindPort}" }, ignoreOld: false);
-        await Task.Delay(300);
+        await TestHelpers.WaitUntilNumNodesAsync(2, TimeSpan.FromSeconds(10), s1, s2);
 
         // Node2 leaves gracefully
         await s2.LeaveAsync();
         await s2.ShutdownAsync();
         s2.Dispose();
-        await Task.Delay(500);
 
         // Verify node2 is marked as Left
+        await TestHelpers.WaitForMemberStatusAsync(s1, "node2", MemberStatus.Left, TimeSpan.FromSeconds(10));
         var members = s1.Members();
         var node2 = members.FirstOrDefault(m => m.Name == "node2");
         node2.Should().NotBeNull();
@@ -181,29 +207,15 @@ public class RegressionTests : IDisposable
         var s2 = await NSerf.Serf.Serf.CreateAsync(config2);
 
         await s1.JoinAsync(new[] { $"127.0.0.1:{config2.MemberlistConfig.BindPort}" }, ignoreOld: false);
-        await Task.Delay(300);
+        await TestHelpers.WaitUntilNumNodesAsync(2, TimeSpan.FromSeconds(10), s1, s2);
 
         // Node2 leaves
         await s2.LeaveAsync();
         await s2.ShutdownAsync();
         s2.Dispose();
-        await Task.Delay(500);
 
         // Verify node2 reaches Left status (from memberlist Dead message)
-        var leftDetected = false;
-        for (int i = 0; i < 20; i++)
-        {
-            var members = s1.Members();
-            var node2 = members.FirstOrDefault(m => m.Name == "node2");
-            if (node2?.Status == MemberStatus.Left)
-            {
-                leftDetected = true;
-                break;
-            }
-            await Task.Delay(100);
-        }
-
-        leftDetected.Should().BeTrue("node2 should reach Left status");
+        await TestHelpers.WaitForMemberStatusAsync(s1, "node2", MemberStatus.Left, TimeSpan.FromSeconds(10));
 
         // Continue checking that leave intents don't downgrade it to Leaving
         await Task.Delay(1000);
@@ -251,7 +263,7 @@ public class RegressionTests : IDisposable
         var s2 = await NSerf.Serf.Serf.CreateAsync(config2);
 
         await s1.JoinAsync(new[] { $"127.0.0.1:{config2.MemberlistConfig.BindPort}" }, ignoreOld: false);
-        await Task.Delay(300);
+        await TestHelpers.WaitUntilNumNodesAsync(2, TimeSpan.FromSeconds(10), s1, s2);
 
         // Initial status should be Alive
         var members1 = s1.Members();
@@ -263,20 +275,7 @@ public class RegressionTests : IDisposable
         s2.Dispose();
 
         // Wait for failure detection (can take a while due to probe intervals)
-        var failureDetected = false;
-        for (int i = 0; i < 50; i++)
-        {
-            await Task.Delay(150);
-            var members = s1.Members();
-            var node2 = members.FirstOrDefault(m => m.Name == "node2");
-            if (node2?.Status == MemberStatus.Failed)
-            {
-                failureDetected = true;
-                break;
-            }
-        }
-
-        failureDetected.Should().BeTrue("node2 should be detected as failed");
+        await TestHelpers.WaitForMemberStatusAsync(s1, "node2", MemberStatus.Failed, TimeSpan.FromSeconds(10));
 
         // Multiple calls to Members() should all return current status (Failed)
         for (int i = 0; i < 5; i++)
@@ -331,35 +330,23 @@ public class RegressionTests : IDisposable
 
         // Join and let node2 build up incarnation number
         await s1.JoinAsync(new[] { $"127.0.0.1:{s2Port}" }, ignoreOld: false);
-        await Task.Delay(500);
+        await TestHelpers.WaitUntilNumNodesAsync(2, TimeSpan.FromSeconds(10), s1, s2);
 
-        // Wait for snapshot flush (500ms interval + buffer)
-        await Task.Delay(800);
+        // Wait for the snapshot to be flushed (node2 must have recorded node1 as alive)
+        await WaitForSnapshotContentAsync(snapshotPath, "alive: node1", TimeSpan.FromSeconds(5));
 
         // Shutdown node2 (failure scenario)
         await s2.ShutdownAsync();
         s2.Dispose();
 
         // Wait for failure detection (can take a while due to probe intervals)
-        var failed = false;
-        for (int i = 0; i < 50; i++)
-        {
-            await Task.Delay(150);
-            var members = s1.Members();
-            var node2 = members.FirstOrDefault(m => m.Name == "node2");
-            if (node2?.Status == MemberStatus.Failed)
-            {
-                failed = true;
-                break;
-            }
-        }
-        failed.Should().BeTrue("node2 should be detected as failed");
+        await TestHelpers.WaitForMemberStatusAsync(s1, "node2", MemberStatus.Failed, TimeSpan.FromSeconds(10));
 
         // Remove failed node
         await s1.RemoveFailedNodeAsync("node2");
-        await Task.Delay(300);
 
         // Verify node2 is Left
+        await TestHelpers.WaitForMemberStatusAsync(s1, "node2", MemberStatus.Left, TimeSpan.FromSeconds(5));
         var members2 = s1.Members();
         var node2Left = members2.FirstOrDefault(m => m.Name == "node2");
         node2Left!.Status.Should().Be(MemberStatus.Left);
@@ -373,20 +360,7 @@ public class RegressionTests : IDisposable
         await s2Restarted.JoinAsync(new[] { $"127.0.0.1:{config1.MemberlistConfig.BindPort}" }, ignoreOld: false);
 
         // Wait for join to propagate and status to update
-        var rejoinDetected = false;
-        for (int i = 0; i < 30; i++)
-        {
-            await Task.Delay(100);
-            var members = s1.Members();
-            var node2 = members.FirstOrDefault(m => m.Name == "node2");
-            if (node2?.Status == MemberStatus.Alive)
-            {
-                rejoinDetected = true;
-                break;
-            }
-        }
-
-        rejoinDetected.Should().BeTrue("node2 should rejoin and become Alive");
+        await TestHelpers.WaitForMemberStatusAsync(s1, "node2", MemberStatus.Alive, TimeSpan.FromSeconds(5));
 
         // Verify final state
         var membersFinal = s1.Members();
@@ -447,11 +421,11 @@ public class RegressionTests : IDisposable
 
         // Step 1: Join
         await s1.JoinAsync([$"127.0.0.1:{s2Port}"], ignoreOld: false);
-        await Task.Delay(500);
+        await TestHelpers.WaitUntilNumNodesAsync(2, TimeSpan.FromSeconds(10), s1, s2);
         s1.NumMembers().Should().Be(2);
 
-        // Wait for snapshot flush
-        await Task.Delay(800);
+        // Wait for the snapshot to be flushed (node2 must have recorded node1 as alive)
+        await WaitForSnapshotContentAsync(snapshotPath, "alive: node1", TimeSpan.FromSeconds(5));
 
         // Step 2: Graceful leave (tests leave intent handling)
         await s2.LeaveAsync();
@@ -459,17 +433,7 @@ public class RegressionTests : IDisposable
         await s2.DisposeAsync();
 
         // Wait for Left status
-        var leftDetected = false;
-        for (var i = 0; i < 30; i++)
-        {
-            await Task.Delay(100);
-            var members = s1.Members();
-            var node2 = members.FirstOrDefault(m => m.Name == "node2");
-            if (node2?.Status != MemberStatus.Left) continue;
-            leftDetected = true;
-            break;
-        }
-        leftDetected.Should().BeTrue("node2 should reach Left status");
+        await TestHelpers.WaitForMemberStatusAsync(s1, "node2", MemberStatus.Left, TimeSpan.FromSeconds(10));
 
         // Verify Left status (not stuck in Leaving)
         var membersLeft = s1.Members();
@@ -493,13 +457,10 @@ public class RegressionTests : IDisposable
         // Wait for probing to detect failure. Poll instead of a single fixed delay so the test
         // tolerates slower gossip convergence under heavy parallel load (it still asserts the
         // same end state below).
-        for (var i = 0; i < 100; i++) // up to ~10s
-        {
-            var probing = s1.Members().FirstOrDefault(m => m.Name == "node2");
-            if (probing?.Status is MemberStatus.Left or MemberStatus.Failed)
-                break;
-            await Task.Delay(100);
-        }
+        await TestHelpers.WaitForConditionAsync(
+            () => s1.Members().FirstOrDefault(m => m.Name == "node2")?.Status is MemberStatus.Left or MemberStatus.Failed,
+            TimeSpan.FromSeconds(10),
+            "node2 should be Left or Failed on s1 after the rejected rejoin");
 
         // Verify that node2 is detected as Failed on s1 (rejoin was rejected, then probing failed)
         var finalMembers = s1.Members();

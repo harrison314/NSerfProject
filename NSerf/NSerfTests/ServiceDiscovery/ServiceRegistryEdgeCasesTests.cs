@@ -521,7 +521,8 @@ public class ServiceRegistryEdgeCasesTests
 
         // Act
         await registry.RegisterInstanceAsync(instance);
-        await Task.Delay(100); // Give async handler time to complete
+        await NSerfTests.Serf.TestHelpers.WaitForConditionAsync(() => Volatile.Read(ref querySucceeded), TimeSpan.FromSeconds(5),
+            "async ServiceChanged handler never completed its query"); // Give async handler time to complete
 
         // Assert - Handler should complete successfully
         Assert.True(querySucceeded);

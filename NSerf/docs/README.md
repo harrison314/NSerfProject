@@ -10,7 +10,7 @@ It provides:
 - A long-running **Serf agent** with a rich **CLI** and **scriptable event handlers**.
 - Integration points for **.NET dependency injection** and examples for HTTP/YARP/ToDo/Chat scenarios.
 
-Targets: .NET 8.
+Targets: .NET 10.
 
 ---
 
@@ -119,7 +119,7 @@ Central class representing a Serf node.
 
 ### Prerequisites
 
-- .NET 8 SDK installed.
+- .NET 10 SDK installed.
 - Repository cloned locally.
 
 ### Build

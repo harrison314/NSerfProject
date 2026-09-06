@@ -44,7 +44,9 @@ public static class KeysCommand
             {
                 await using var client = await RpcHelper.ConnectAsync(addr, auth, cancellationToken);
                 var response = await client.ListKeysAsync(cancellationToken);
-                
+
+                if (await ReportFailuresAsync(response)) return 1;
+
                 Console.WriteLine($"Keys in cluster: {response.Keys.Count}");
                 Console.WriteLine($"Nodes: {response.NumNodes}, Responses: {response.NumResp}");
                 Console.WriteLine();
@@ -52,6 +54,16 @@ public static class KeysCommand
                 foreach (var kvp in response.Keys)
                 {
                     Console.WriteLine($"  {kvp.Key} - {kvp.Value} node(s)");
+                }
+
+                if (response.PrimaryKeys.Count > 0)
+                {
+                    Console.WriteLine();
+                    Console.WriteLine("Primary keys:");
+                    foreach (var kvp in response.PrimaryKeys)
+                    {
+                        Console.WriteLine($"  {kvp.Key} - {kvp.Value} node(s)");
+                    }
                 }
                 
                 return 0;
@@ -81,18 +93,11 @@ public static class KeysCommand
             {
                 await using var client = await RpcHelper.ConnectAsync(addr, auth, cancellationToken);
                 var response = await client.InstallKeyAsync(key, cancellationToken);
-                
+
+                if (await ReportFailuresAsync(response)) return 1;
+
                 Console.WriteLine("Successfully installed key");
                 Console.WriteLine($"Nodes: {response.NumNodes}, Responses: {response.NumResp}");
-
-                if (response.Messages.Length <= 0) return 0;
-                
-                Console.WriteLine("Messages:");
-                foreach (var msg in response.Messages)
-                {
-                    Console.WriteLine($"  {msg}");
-                }
-
                 return 0;
             }
             catch (Exception ex)
@@ -120,7 +125,9 @@ public static class KeysCommand
             {
                 await using var client = await RpcHelper.ConnectAsync(addr, auth, cancellationToken);
                 var response = await client.UseKeyAsync(key, cancellationToken);
-                
+
+                if (await ReportFailuresAsync(response)) return 1;
+
                 Console.WriteLine("Successfully changed primary key");
                 Console.WriteLine($"Nodes: {response.NumNodes}, Responses: {response.NumResp}");
                 
@@ -151,7 +158,9 @@ public static class KeysCommand
             {
                 await using var client = await RpcHelper.ConnectAsync(addr, auth, cancellationToken);
                 var response = await client.RemoveKeyAsync(key, cancellationToken);
-                
+
+                if (await ReportFailuresAsync(response)) return 1;
+
                 Console.WriteLine("Successfully removed key");
                 Console.WriteLine($"Nodes: {response.NumNodes}, Responses: {response.NumResp}");
                 
@@ -170,5 +179,21 @@ public static class KeysCommand
         command.Add(removeCommand);
 
         return command;
+    }
+
+    /// <summary>
+    /// Writes per-node failures to stderr. Returns true if any node reported an error.
+    /// </summary>
+    private static async Task<bool> ReportFailuresAsync(NSerf.Client.Responses.KeyResponse response)
+    {
+        if (response.NumErr == 0) return false;
+
+        await Console.Error.WriteLineAsync($"Error: {response.NumErr}/{response.NumNodes} nodes reported failure");
+        foreach (var kvp in response.Messages.Where(m => !string.IsNullOrEmpty(m.Value)))
+        {
+            await Console.Error.WriteLineAsync($"  {kvp.Key}: {kvp.Value}");
+        }
+
+        return true;
     }
 }

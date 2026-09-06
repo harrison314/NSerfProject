@@ -492,15 +492,17 @@ public class StateHandlers(Memberlist memberlist, ILogger? logger)
             // Check if this is us
             if (state.Node.Name == memberlist.Config.Name)
             {
-                // If this is NOT a graceful leave (Node != From) and we're not leaving, refute it
-                if (dead.Node != dead.From && !memberlist.IsLeaving)
+                // Unless we are leaving, any dead message about ourselves must be refuted. A self-announced
+                // (Node == From) message can only be a stale leave from a previous incarnation of this
+                // node, and accepting it would silently mark a live node as Left (Go: deadNode).
+                if (!memberlist.IsLeaving)
                 {
                     RefuteNode(state, dead.Incarnation);
                     logger?.LogWarning("Refuting dead message from {From}", dead.From);
                     return; // Don't mark ourselves dead
                 }
 
-                // If it's a graceful leave (Node==From) or we're leaving, broadcast and continue processing
+                // We are leaving: broadcast and continue processing
             }
 
             // Broadcast the dead message for other nodes
@@ -585,7 +587,10 @@ public class StateHandlers(Memberlist memberlist, ILogger? logger)
         // This will bump our incarnation and broadcast an Alive message to break the tombstone.
         var ourState = remoteNodes.FirstOrDefault(n => n.Name == memberlist.Config.Name);
 
+        // Never while we are leaving: Go's deadNode refutes only when !hasLeft(), and a node that
+        // resurrects itself mid-leave is later seen as failed instead of left by its peers.
         if (
+            !memberlist.IsLeaving &&
             ourState is { State: NodeStateType.Dead or NodeStateType.Left } &&
             memberlist.NodeMap.TryGetValue(memberlist.Config.Name, out var localState) &&
             ourState.Incarnation >= localState.Incarnation
