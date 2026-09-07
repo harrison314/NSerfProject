@@ -63,6 +63,19 @@ public class SnapshotterDurabilityAndDisposalTests : IDisposable
     };
 
     /// <summary>
+    /// Reads the snapshot file while the snapshotter may still hold it open for writing.
+    /// File.ReadAllText opens with FileShare.Read, which Windows rejects while another handle has
+    /// write access ("being used by another process"); POSIX has no such check, so the mismatch
+    /// only shows on Windows. Granting ReadWrite sharing matches how the snapshotter opens the file.
+    /// </summary>
+    private static async Task<string> ReadSnapshotAsync(string path)
+    {
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        using var reader = new StreamReader(fs);
+        return await reader.ReadToEndAsync();
+    }
+
+    /// <summary>
     /// N member events must not cause any fsync (Flush(flushToDisk: true)),
     /// while the "alive:" lines must still be visible to readers promptly
     /// (the StreamWriter buffer is flushed to the OS, not to disk).
@@ -92,12 +105,7 @@ public class SnapshotterDurabilityAndDisposalTests : IDisposable
         snap.AliveNodes().Should().HaveCount(eventCount, "all member events should be processed");
 
         // Content must be visible to readers without any fsync
-        string content;
-        using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-        using (var reader = new StreamReader(fs))
-        {
-            content = await reader.ReadToEndAsync();
-        }
+        var content = await ReadSnapshotAsync(path);
 
         var aliveLines = content.Split('\n').Count(l => l.StartsWith("alive:"));
         aliveLines.Should().Be(eventCount, "every member event should be visible in the snapshot file");
@@ -141,7 +149,7 @@ public class SnapshotterDurabilityAndDisposalTests : IDisposable
         // WaitAsync is completed at the end of StreamAsync, which DisposeAsync awaits
         snap.WaitAsync().IsCompleted.Should().BeTrue("the stream loop should have finished");
 
-        var content = await File.ReadAllTextAsync(path);
+        var content = await ReadSnapshotAsync(path);
         content.Should().Contain("alive: node1", "events processed before disposal must be persisted");
     }
 
@@ -239,7 +247,7 @@ public class SnapshotterDurabilityAndDisposalTests : IDisposable
         snap.SyncToDiskCount.Should().BeLessThanOrEqualTo(1,
             "draining queued member events must not fsync per event; only the final shutdown sync is allowed");
 
-        var content = await File.ReadAllTextAsync(path);
+        var content = await ReadSnapshotAsync(path);
         content.Should().Contain("alive: test1", "drained events must be persisted");
 
         await snap.DisposeAsync();
@@ -298,7 +306,7 @@ public class SnapshotterDurabilityAndDisposalTests : IDisposable
         await snap.LeaveAsync();
         snap.SyncToDiskCount.Should().BeGreaterThanOrEqualTo(1, "the leave marker must be fsynced");
 
-        var content = await File.ReadAllTextAsync(path);
+        var content = await ReadSnapshotAsync(path);
         content.Should().Contain("leave", "the leave marker must be written");
 
         shutdownCts.Cancel();
